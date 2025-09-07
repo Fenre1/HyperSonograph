@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional
+from collections import defaultdict
 import numpy as np
 import torch
 import librosa
@@ -73,6 +74,60 @@ class SegmentMeta:
     end_s: float
     model: str
     dim: int
+
+@dataclass
+class SongEmbedding:
+    """Song-level representation for a single (file, model) pair."""
+    file: str
+    model: str
+    centroid_D: np.ndarray
+    stats_2D: np.ndarray
+
+
+def _l2_normalize(v: np.ndarray) -> np.ndarray:
+    """Return L2-normalized copy of ``v`` (float32)."""
+    v = np.asarray(v, dtype=np.float32)
+    norm = np.linalg.norm(v)
+    if norm > 0:
+        v = v / norm
+    return v.astype(np.float32)
+
+
+def _compute_song_embeddings(X: np.ndarray, rows: List[Dict[str, Any]]) -> List[SongEmbedding]:
+    """Aggregate segment vectors into song-level embeddings."""
+    grouped: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+    for idx, r in enumerate(rows):
+        grouped[(r["file"], r["model"])].append(idx)
+
+    songs: List[SongEmbedding] = []
+    for (file, model), idxs in grouped.items():
+        V = X[idxs]
+        weights = np.array([
+            rows[i]["end_s"] - rows[i]["start_s"] for i in idxs
+        ], dtype=np.float32).reshape(-1, 1)
+        w_sum = float(weights.sum())
+        if w_sum <= 0:
+            D = V.shape[1]
+            centroid = np.zeros(D, dtype=np.float32)
+            stats = np.zeros(2 * D, dtype=np.float32)
+        else:
+            mean = (V * weights).sum(axis=0) / w_sum
+            centroid = _l2_normalize(mean)
+            var = ((V - mean) ** 2 * weights).sum(axis=0) / w_sum
+            std = np.sqrt(np.maximum(var, 1e-8))
+            stats_vec = np.concatenate([mean, std], axis=0)
+            stats = _l2_normalize(stats_vec)
+
+        songs.append(
+            SongEmbedding(
+                file=file,
+                model=model,
+                centroid_D=centroid.astype(np.float32),
+                stats_2D=stats.astype(np.float32),
+            )
+        )
+
+    return songs
 
 
 class AudioFeatureExtractorBase:
@@ -154,6 +209,7 @@ class AudioFeatureExtractorBase:
                 v = np.asarray(v, dtype=np.float32)
                 if v.ndim != 1:
                     v = v.reshape(-1)  # force 1D
+                v = _l2_normalize(v)                    
                 vecs.append(v)
                 rows.append({"file": f, "start_s": s, "end_s": e,
                             "model": self.model_name, "dim": int(v.shape[-1])})
@@ -164,10 +220,16 @@ class AudioFeatureExtractorBase:
         X = np.vstack(vecs).astype(np.float32, copy=False)  # (N, D)
         return X, rows
 
-
+    def extract_segments_and_songs(
+        self, file_list: List[str]
+    ) -> Tuple[np.ndarray, List[Dict[str, Any]], List[SongEmbedding]]:
+        """Return segment embeddings with metadata and pooled song-level vectors."""
+        X, rows = self.extract_features_with_metadata(file_list)
+        songs = _compute_song_embeddings(X, rows)
+        return X, rows, songs
 
 # ----------------------------
-# OpenL3 (optional)
+# OpenL3
 # ----------------------------
 
 class OpenL3FeatureExtractor(AudioFeatureExtractorBase):
@@ -380,6 +442,7 @@ class MultiModelAudioExtractor:
                     v = np.asarray(v, dtype=np.float32)
                     if v.ndim != 1:
                         v = v.reshape(-1)
+                    v = _l2_normalize(v)                        
 
                     if self.combine == "concat":
                         parts.append(v)  # type: ignore
@@ -392,6 +455,7 @@ class MultiModelAudioExtractor:
                     if parts is None or len(parts) != len(self.extractors):
                         continue  # a sub-embed failed/was empty
                     vcat = np.concatenate(parts, axis=0)
+                    vcat = _l2_normalize(vcat)                    
                     all_vecs.append(vcat)
                     model_tag = "+".join(ext.model_name for ext in self.extractors)
                     all_rows.append({"file": f, "start_s": s, "end_s": e,
@@ -408,6 +472,14 @@ class MultiModelAudioExtractor:
 
         X = np.vstack(all_vecs).astype(np.float32, copy=False)  # (N, D)
         return X, all_rows
+
+    def extract_segments_and_songs(self, file_list: List[str]) -> Tuple[np.ndarray, List[Dict[str, Any]], List[SongEmbedding]]:
+        """Return segment embeddings with metadata and pooled song-level vectors."""
+        X, rows = self.extract_features_with_metadata(file_list)
+        songs = _compute_song_embeddings(X, rows)
+        return X, rows, songs
+
+
 
     def extract_feature_arrays(self, file_list: List[str]) -> Tuple[np.ndarray, ...]:
         """
