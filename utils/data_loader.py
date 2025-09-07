@@ -1,4 +1,3 @@
-# data_loader.py ------------------------------------------------------------
 import os
 import h5py
 import numpy as np
@@ -6,7 +5,6 @@ import pandas as pd
 
 DATA_DIRECTORY = "F:/PhD/Projects/HyperGalleryDash/Sessions"
 
-# --------------------------------------------------------------------------
 def _prepare_hypergraph_structures(df):
     """Return (hyperedges_dict, image_mapping_dict)."""
     if "image_path" in df.columns:

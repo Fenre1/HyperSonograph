@@ -1,5 +1,4 @@
 darkdetect
-fcmeans
 h5py
 matplotlib
 natsort

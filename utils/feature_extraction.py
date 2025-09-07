@@ -1,220 +1,512 @@
+# audio_features.py
+# %%
 from __future__ import annotations
 
 import os
 from pathlib import Path
-
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Any, Optional
 import numpy as np
 import torch
-import timm
-from PIL import Image, ImageFile
-import timm.data
-from torch.utils.data import Dataset, DataLoader
-import open_clip
-import urllib.request
-from typing import List
-import re
+import librosa
+import soundfile as sf
+import warnings
 
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+# ----------------------------
+# Model cache dir
+# ----------------------------
+try:
+    _here = Path(__file__).resolve()
+    _root = _here.parent.parent
+except NameError:
+    # __file__ can be undefined in notebooks; fall back to CWD
+    _root = Path.cwd()
 
-MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
-MODEL_DIR.mkdir(exist_ok=True)
+MODEL_DIR = _root / "models"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("TORCH_HOME", str(MODEL_DIR))
 
-#'swinv2_large_window12to24_192to384'
-class ImageFileDataset(Dataset):
-    """ 
-    A PyTorch Dataset for loading and transforming images given a list of file paths.
-    """
-    def __init__(self, file_list, transform, image_size=None):
-        self.file_list = file_list
-        self.transform = transform
-        self.image_size = image_size    
+# ----------------------------
+# Helpers: loading & segmentation
+# ----------------------------
 
-    def __len__(self):
-        return len(self.file_list)
-
-    def __getitem__(self, index):
-        file_path = self.file_list[index]
-        try:
-            image = Image.open(file_path).convert('RGB')
-        except Exception as e:
-            print(f"Warning: failed to load {file_path}: {e}")
-            if self.image_size:
-                image = Image.new('RGB', self.image_size)
-            else:
-                raise
-        image = self.transform(image)
-        return image
-
-class FeatureExtractor:
-    """
-    Extracts features from images using a timm model.
-    """
-    def __init__(self, model_name: str, batch_size: int = 32):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model_name = model_name
-        self.batch_size = batch_size
-
-        self.model = timm.create_model(model_name, pretrained=True, num_classes=0)
-        self.model.to(self.device)
-        self.model.eval()
-
-        self.transform = timm.data.transforms_factory.create_transform(
-            input_size=self.model.default_cfg['input_size']
-        )
-
-        _, h, w = self.model.default_cfg['input_size']
-        self.image_size = (w, h)
+def load_audio_mono(path: str | Path, target_sr: int = 48000,
+                    offset: float = 0.0, duration: Optional[float] = None) -> Tuple[np.ndarray, int]:
+    # first attempt
+    y, sr = librosa.load(str(path), sr=target_sr, mono=True,
+                         offset=float(offset), duration=duration)
+    # tail rounding can yield empty; retry with a tiny pad
+    if y.size == 0 and duration is not None and duration > 0:
+        y, sr = librosa.load(str(path), sr=target_sr, mono=True,
+                             offset=float(offset), duration=float(duration) + 1e-2)
+    return np.asarray(y, dtype=np.float32, order="C"), target_sr
 
 
+def segment_bounds(
+    total_seconds: float,
+    segment_seconds: float = 30.0,
+    hop_seconds: Optional[float] = None,
+) -> List[Tuple[float, float]]:
+    hop = float(hop_seconds) if hop_seconds is not None else float(segment_seconds) / 2.0
+    if total_seconds <= 0 or segment_seconds <= 0 or hop <= 0:
+        return []
+    bounds: List[Tuple[float, float]] = []
+    s = 0.0
+    while s < total_seconds:
+        e = min(s + segment_seconds, total_seconds)
+        # avoid very tiny tail segments
+        if e - s < 0.5:
+            break
+        bounds.append((s, e))
+        s += hop
+    return bounds
 
 
-    def extract_features(self, file_list: list, progress_callback=None) -> np.ndarray:
-        dataset = ImageFileDataset(file_list, self.transform, self.image_size)
-        loader = DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=0  
-        )
+# ----------------------------
+# Base API
+# ----------------------------
 
-        all_features = []
-        processed = 0
-        total = len(file_list)
-        for images in loader:
-            images = images.to(self.device)
-            with torch.no_grad():
-                features = self.model(images)
-            all_features.append(features.cpu().numpy())
-            processed += images.size(0)
-            if progress_callback:
-                progress_callback(processed, total)
-
-        return np.vstack(all_features)
+@dataclass
+class SegmentMeta:
+    file: str
+    start_s: float
+    end_s: float
+    model: str
+    dim: int
 
 
-class Swinv2LargeFeatureExtractor(FeatureExtractor):
-    def __init__(self, batch_size: int = 32):
-        super().__init__("swinv2_large_window12to24_192to384", batch_size)
-
-class OpenClipFeatureExtractor:
-    """Extract features using an OpenCLIP model."""
-
-    def __init__(self, model_name: str = "ViT-B-32", *, pretrained: str = "laion2b_s34b_b79k", batch_size: int = 32):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.batch_size = batch_size
-        self.model, _, self.preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
-        self.model.to(self.device)
-        self.model.eval()
-        self.image_size = (224, 224)
-
-    @property
-    def transform(self):
-        return self.preprocess
-
-    def extract_features(self, file_list: list, progress_callback=None) -> np.ndarray:
-        dataset = ImageFileDataset(file_list, self.preprocess, self.image_size)
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=0)
-        all_features = []
-        processed = 0
-        total = len(file_list)
-        for images in loader:
-            images = images.to(self.device)
-            with torch.no_grad():
-                feats = self.model.encode_image(images)
-            all_features.append(feats.cpu().numpy())
-            processed += images.size(0)
-            if progress_callback:
-                progress_callback(processed, total)
-        return np.vstack(all_features)
-    
-    def encode_text(self, texts: list[str]) -> np.ndarray:
-        """Return OpenCLIP embeddings for the given text strings."""
-        tokens = open_clip.tokenize(texts).to(self.device)
-        with torch.no_grad():
-            feats = self.model.encode_text(tokens)
-        return feats.cpu().numpy()
-    
-
-_PLACES_URL = (
-    "http://places2.csail.mit.edu/models_places365/densenet161_places365.pth.tar"
-)
-
-def _download_places365(checkpoint_dir: str | Path = MODEL_DIR / "places365") -> Path:
-    checkpoint_dir = Path(checkpoint_dir).expanduser()
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = checkpoint_dir / "densenet161_places365.pth.tar"
-    if not ckpt_path.exists():
-        print("Downloading DenseNet_161 Places365 weights …")
-        urllib.request.urlretrieve(_PLACES_URL, ckpt_path)
-    return ckpt_path
-
-
-
-
-_LEGACY_PATTERN = re.compile(r"\.(norm|relu|conv)\.(\d+)")   
-
-def _remap_legacy_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Convert PyTorch-0.2 DenseNet key style to modern style."""
-    new_state = {}
-    for k, v in state_dict.items():
-        k = k.replace("module.", "")
-        k = _LEGACY_PATTERN.sub(lambda m: f".{m.group(1)}{m.group(2)}", k)
-        new_state[k] = v
-    return new_state
-
-class DenseNet161Places365FeatureExtractor:
-    """Return 2208 length features of DenseNet-161-Places365."""
+class AudioFeatureExtractorBase:
+    model_name: str
 
     def __init__(
         self,
-        batch_size: int = 32,
-        checkpoint_path: str | Path | None = None,
-        *,
-        num_workers: int = 0,
+        segment_seconds: float = 30.0,
+        hop_seconds: Optional[float] = None,
+        target_sr: int = 48000,
+        device: Optional[str] = None,
     ):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.batch_size, self.num_workers = batch_size, num_workers
-
-        # 1. Architecture **without** classifier
-        self.model = timm.create_model("densenet161", pretrained=False, num_classes=0)
-        self.model.to(self.device).eval()
-
-        # 2. Load & remap legacy weights
-        ckpt_path = (
-            Path(checkpoint_path) if checkpoint_path else _download_places365()
+        self.segment_seconds = float(segment_seconds)
+        self.hop_seconds = hop_seconds
+        self.target_sr = int(target_sr)
+        self.device = torch.device(device) if device else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
         )
-        raw_ckpt = torch.load(ckpt_path, map_location="cpu", encoding="latin1")
-        state = raw_ckpt.get("state_dict", raw_ckpt)
-        state = _remap_legacy_keys(state)
+        self._init_model()
 
-        # Drop the original classifier (fully‑connected) layer
-        state = {k: v for k, v in state.items() if not k.startswith("classifier.")}
-        missing, unexpected = self.model.load_state_dict(state, strict=False)
-        assert not unexpected, f"Unexpected keys: {unexpected}"     # must be empty
-        # 'missing' only contains 'classifier.weight/bias' – expected
+    # to be implemented by subclasses
+    def _init_model(self) -> None: ...
+    
+    def _embed_waveform(self, y: np.ndarray, sr: int) -> np.ndarray:
+        """
+        Generic HF path: accepts mono float32 y, sampling rate sr.
+        Handles both standard and custom processor APIs.
+        If a subclass defines self.layer, we respect it; otherwise use last layer.
+        """
+        # prepare inputs (support both common processor signatures)
+        try:
+            inputs = self.processor([y], sampling_rate=sr, return_tensors="pt")  # type: ignore[attr-defined]
+        except TypeError:
+            inputs = self.processor(audios=[y], sampling_rate=sr, return_tensors="pt")  # type: ignore[attr-defined]
 
-        # 3. Default Places365 transform (256 → centre‑crop 224)
-        self.transform = timm.data.transforms_factory.create_transform(
-            input_size=(3, 224, 224), interpolation="bicubic", crop_pct=224 / 256
-        )
+        inputs = {k: (v.to(self.device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
 
-
-    def extract_features(self, file_list: List[str], progress_callback=None) -> np.ndarray:
-        loader = DataLoader(
-            ImageFileDataset(file_list, self.transform),
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-        )
-        feats = []
-        processed = 0
-        total = len(file_list)
         with torch.no_grad():
-            for imgs in loader:
-                feats.append(self.model(imgs.to(self.device)).cpu().numpy())
-                processed += imgs.size(0)
-                if progress_callback:
-                    progress_callback(processed, total)
-        return np.vstack(feats)
+            out = self.model(**inputs, output_hidden_states=True)  # type: ignore[attr-defined]
 
+        # choose layer
+        layer_idx = getattr(self, "layer", None)
+        if hasattr(out, "hidden_states") and out.hidden_states is not None and layer_idx is not None:
+            hs = out.hidden_states[layer_idx]
+        else:
+            hs = out.last_hidden_state
+
+        # pool over time if needed
+        if hs.dim() == 3:
+            pooled = hs.mean(dim=1)
+        elif hs.dim() == 2:
+            pooled = hs
+        else:
+            raise RuntimeError(f"Unexpected tensor rank for hidden states: {hs.shape}")
+
+        return pooled.squeeze(0).float().cpu().numpy()
+    
+    def output_dim(self) -> int: ...
+
+    def extract_features_with_metadata(
+        self, file_list: List[str]
+    ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+        rows: List[Dict[str, Any]] = []
+        vecs: List[np.ndarray] = []
+
+        for f in file_list:
+            try:
+                info = sf.info(f)
+                total_seconds = float(info.frames) / float(info.samplerate)
+            except Exception:
+                y_tmp, sr_tmp = load_audio_mono(f, target_sr=self.target_sr)
+                total_seconds = len(y_tmp) / float(sr_tmp)
+
+            for (s, e) in segment_bounds(total_seconds, self.segment_seconds, self.hop_seconds):
+                y, sr = load_audio_mono(f, target_sr=self.target_sr, offset=s, duration=(e - s))
+                if y.size == 0:
+                    continue  # skip empty tails safely
+                v = self._embed_waveform(y, sr)
+                v = np.asarray(v, dtype=np.float32)
+                if v.ndim != 1:
+                    v = v.reshape(-1)  # force 1D
+                vecs.append(v)
+                rows.append({"file": f, "start_s": s, "end_s": e,
+                            "model": self.model_name, "dim": int(v.shape[-1])})
+
+        if not vecs:
+            return np.zeros((0, self.output_dim()), dtype=np.float32), []
+
+        X = np.vstack(vecs).astype(np.float32, copy=False)  # (N, D)
+        return X, rows
+
+
+
+# ----------------------------
+# OpenL3 (optional)
+# ----------------------------
+
+class OpenL3FeatureExtractor(AudioFeatureExtractorBase):
+    """
+    Optional: requires openl3 (works well on Python 3.11).
+    pip install openl3
+    """
+
+    def __init__(
+        self,
+        input_repr: str = "mel256",
+        content_type: str = "music",
+        embedding_size: int = 512,
+        center: bool = False,
+        hop_size: float = 0.5,
+        **kwargs,
+    ):
+        self.input_repr = input_repr
+        self.content_type = content_type
+        self.embedding_size = int(embedding_size)
+        self.center = center
+        self.hop_size = float(hop_size)
+        super().__init__(**kwargs)
+
+    def _init_model(self) -> None:
+        try:
+            import openl3  # lazy import
+            self._openl3 = openl3
+            self.model_name = f"openl3_{self.content_type}_{self.input_repr}_{self.embedding_size}"
+        except Exception as e:
+            raise ImportError(
+                "OpenL3 not available. Install with `pip install openl3` (Python 3.11 recommended)."
+            ) from e
+
+    def _embed_waveform(self, y: np.ndarray, sr: int) -> np.ndarray:
+        emb, _ = self._openl3.get_audio_embedding(
+            y,
+            sr,
+            input_repr=self.input_repr,
+            content_type=self.content_type,
+            embedding_size=self.embedding_size,
+            center=self.center,
+            hop_size=self.hop_size,
+        )
+        return np.asarray(emb.mean(axis=0), dtype=np.float32, order="C")
+
+    def output_dim(self) -> int:
+        return int(self.embedding_size)
+
+
+# ----------------------------
+# CLAP (LAION-CLAP)
+# ----------------------------
+
+class CLAPFeatureExtractor(AudioFeatureExtractorBase):
+    """
+    pip install laion-clap
+    """
+
+    def __init__(self, clap_model: str = "HTSAT-large", **kwargs):
+        self.clap_model = clap_model
+        super().__init__(**kwargs)
+
+    def _init_model(self) -> None:
+        import laion_clap
+        self._clap = laion_clap
+        self.model = self._clap.CLAP_Module(enable_fusion=False, amodel=self.clap_model, device=str(self.device))
+        self.model.eval()
+        self.model_name = f"clap_{self.clap_model}"
+        self.target_sr = 48000  
+
+    def _embed_waveform(self, y: np.ndarray, sr: int) -> np.ndarray:
+        # Ensure float32, contiguous
+        y = np.asarray(y, dtype=np.float32, order="C")
+
+        with torch.no_grad():
+            try:
+                # Newer laion-clap versions
+                emb_list = self.model.get_audio_embedding_from_data(x=[y], sr=sr, use_tensor=False)
+            except TypeError:
+                # Older laion-clap: no `sr` kw. It expects 48kHz audio.
+                if sr != 48000:
+                    y = librosa.resample(y, orig_sr=sr, target_sr=48000)
+                    y = np.asarray(y, dtype=np.float32, order="C")
+                emb_list = self.model.get_audio_embedding_from_data(x=[y], use_tensor=False)
+
+        return np.asarray(emb_list[0], dtype=np.float32, order="C")
+
+    def output_dim(self) -> int:
+        # CLAP projection dim is typically 512 for HTSAT variants
+        return 512
+
+
+# ----------------------------
+# MERT (HF Transformers)
+# ----------------------------
+
+class MERTFeatureExtractor(AudioFeatureExtractorBase):
+    """
+    MERT from Hugging Face. Needs nnAudio for CQT features.
+    pip install transformers torchaudio nnAudio
+    """
+
+    def __init__(self, hf_model: str = "m-a-p/MERT-v1-95M", layer: int = -1, **kwargs):
+        self.hf_model = hf_model
+        self.layer = layer  # respect this in base _embed_waveform
+        super().__init__(**kwargs)
+
+    def _init_model(self) -> None:
+        from transformers import AutoProcessor, AutoModel
+        self.model_name = f"mert_{Path(self.hf_model).name}"
+        try:
+            self.processor = AutoProcessor.from_pretrained(self.hf_model, trust_remote_code=True)
+            self.model = AutoModel.from_pretrained(
+                self.hf_model, trust_remote_code=True, use_safetensors=True
+            ).to(self.device).eval()
+            # Align to the processor's expected sampling rate (e.g., 24000)
+            sr = getattr(self.processor, "sampling_rate", None)
+            if sr is None:
+                fe = getattr(self.processor, "feature_extractor", None)
+                sr = getattr(fe, "sampling_rate", 24000)
+            self.target_sr = int(sr)  # <-- add these lines
+        except Exception as e:
+            raise RuntimeError(
+                "MERT load failed. Tips: `pip install nnAudio`; ensure internet "
+                f"access for first run; consider device='cpu'. Original error: {e}"
+            ) from e
+
+    def output_dim(self) -> int:
+        try:
+            return int(getattr(self.model.config, "hidden_size"))  # type: ignore[attr-defined]
+        except Exception:
+            # Fallback for known variant
+            return 768  # 95M variant
+
+
+# ----------------------------
+# Multi-model wrapper
+# ----------------------------
+
+class MultiModelAudioExtractor:
+    """
+    Runs multiple models per segment.
+    combine="concat" -> one row per segment with concatenated vectors.
+    combine="separate" -> one row per model per segment.
+    """
+
+    def __init__(
+        self,
+        extractors: List[AudioFeatureExtractorBase],
+        combine: str = "concat",
+        segment_seconds: float = 30.0,
+        hop_seconds: Optional[float] = None,
+        ref_sr: int = 48000,
+    ):
+        assert combine in ("concat", "separate")
+        if not extractors:
+            raise ValueError("At least one extractor required")
+        self.extractors = extractors
+        self.combine = combine
+        self.segment_seconds = float(segment_seconds)
+        self.hop_seconds = hop_seconds if hop_seconds is not None else float(segment_seconds) / 2.0
+        self.ref_sr = int(ref_sr)
+
+    def extract_features_with_metadata(self, file_list: List[str]) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+        all_rows: List[Dict[str, Any]] = []
+        all_vecs: List[np.ndarray] = []
+
+        for f in file_list:
+            try:
+                info = sf.info(f)
+                total_seconds = float(info.frames) / float(info.samplerate)
+            except Exception:
+                y_tmp, sr_tmp = load_audio_mono(f, target_sr=self.ref_sr)
+                total_seconds = len(y_tmp) / float(sr_tmp)
+
+            bounds = segment_bounds(total_seconds, self.segment_seconds, self.hop_seconds)
+            if not bounds:
+                continue
+
+            # Decode once per bound at reference SR
+            seg_cache: List[Tuple[np.ndarray, int]] = []
+            filtered_bounds: List[Tuple[float, float]] = []
+            for (s, e) in bounds:
+                y_ref, sr_ref = load_audio_mono(f, target_sr=self.ref_sr, offset=s, duration=(e - s))
+                if y_ref.size == 0 or len(y_ref) < int(0.05 * self.ref_sr):  # skip empty/ultra-short
+                    continue
+                seg_cache.append((y_ref, sr_ref))
+                filtered_bounds.append((s, e))
+
+            for i, (s, e) in enumerate(filtered_bounds):
+                y_ref, sr_ref = seg_cache[i]
+                if self.combine == "concat":
+                    parts: List[np.ndarray] = []
+
+                for ext in self.extractors:
+                    # resample per extractor SR
+                    if ext.target_sr != sr_ref:
+                        y = librosa.resample(y_ref, orig_sr=sr_ref, target_sr=ext.target_sr)
+                        y = np.asarray(y, dtype=np.float32, order="C")
+                        sr = ext.target_sr
+                    else:
+                        y, sr = y_ref, sr_ref
+                    if y.size == 0:
+                        # skip this segment entirely
+                        parts = None  # type: ignore
+                        break
+
+                    v = ext._embed_waveform(y, sr)
+                    v = np.asarray(v, dtype=np.float32)
+                    if v.ndim != 1:
+                        v = v.reshape(-1)
+
+                    if self.combine == "concat":
+                        parts.append(v)  # type: ignore
+                    else:
+                        all_vecs.append(v)
+                        all_rows.append({"file": f, "start_s": s, "end_s": e,
+                                        "model": ext.model_name, "dim": int(v.shape[-1])})
+
+                if self.combine == "concat":
+                    if parts is None or len(parts) != len(self.extractors):
+                        continue  # a sub-embed failed/was empty
+                    vcat = np.concatenate(parts, axis=0)
+                    all_vecs.append(vcat)
+                    model_tag = "+".join(ext.model_name for ext in self.extractors)
+                    all_rows.append({"file": f, "start_s": s, "end_s": e,
+                                    "model": model_tag, "dim": int(vcat.shape[-1])})
+
+        # Always return a tuple
+        if not all_vecs:
+            if self.combine == "concat":
+                total_dim = int(sum(ext.output_dim() for ext in self.extractors))
+            else:
+                # can't know per-model dim here reliably; return 0-width matrix
+                total_dim = 0
+            return np.zeros((0, total_dim), dtype=np.float32), []
+
+        X = np.vstack(all_vecs).astype(np.float32, copy=False)  # (N, D)
+        return X, all_rows
+
+    def extract_feature_arrays(self, file_list: List[str]) -> Tuple[np.ndarray, ...]:
+        """
+        Returns a tuple of (X_model0, X_model1, ...), in the same order as self.extractors.
+        Each X_modeli is float32 with shape (N_segments_total, D_i).
+        No metadata, no padding, no mixing.
+        """
+        per_vecs: List[List[np.ndarray]] = [[] for _ in self.extractors]
+
+        for f in file_list:
+            # duration
+            try:
+                info = sf.info(f)
+                total_seconds = float(info.frames) / float(info.samplerate)
+            except Exception:
+                y_tmp, sr_tmp = load_audio_mono(f, target_sr=self.ref_sr)
+                total_seconds = len(y_tmp) / float(sr_tmp)
+
+            bounds = segment_bounds(total_seconds, self.segment_seconds, self.hop_seconds)
+            if not bounds:
+                continue
+
+            # decode once per segment at reference SR and filter empties/very short
+            seg_cache: List[Tuple[np.ndarray, int]] = []
+            for (s, e) in bounds:
+                y_ref, sr_ref = load_audio_mono(f, target_sr=self.ref_sr, offset=s, duration=(e - s))
+                if y_ref.size == 0 or len(y_ref) < int(0.05 * self.ref_sr):
+                    continue
+                seg_cache.append((y_ref, sr_ref))
+
+            # run all extractors for each kept segment
+            for y_ref, sr_ref in seg_cache:
+                for j, ext in enumerate(self.extractors):
+                    if ext.target_sr != sr_ref:
+                        y = librosa.resample(y_ref, orig_sr=sr_ref, target_sr=ext.target_sr)
+                        y = np.asarray(y, dtype=np.float32, order="C")
+                        sr = ext.target_sr
+                    else:
+                        y, sr = y_ref, sr_ref
+                    if y.size == 0:
+                        continue
+                    v = ext._embed_waveform(y, sr)
+                    v = np.asarray(v, dtype=np.float32)
+                    if v.ndim != 1:
+                        v = v.reshape(-1)
+                    per_vecs[j].append(v)
+
+        # stack per model; if none for a model, return (0, D_i)
+        arrays: List[np.ndarray] = []
+        for j, ext in enumerate(self.extractors):
+            if per_vecs[j]:
+                X = np.vstack(per_vecs[j]).astype(np.float32, copy=False)
+            else:
+                X = np.zeros((0, ext.output_dim()), dtype=np.float32)
+            arrays.append(X)
+
+        return tuple(arrays)
+
+# ----------------------------
+# Factory: build available models (OpenL3 optional)
+# ----------------------------
+
+def build_windows_extractors(
+    segment_seconds: float = 30.0,
+    hop_seconds: float | None = None,
+    target_sr: int = 48_000,
+    device: str | None = None,
+):
+    exts: List[AudioFeatureExtractorBase] = []
+
+    # Try OpenL3 (optional)
+    try:
+        exts.append(OpenL3FeatureExtractor(segment_seconds=segment_seconds,
+                                           hop_seconds=hop_seconds,
+                                           target_sr=target_sr,
+                                           device=device or "cpu"))
+    except ImportError as e:
+        warnings.warn(str(e))
+
+    # CLAP (works fine on CPU too)
+    exts.append(CLAPFeatureExtractor(segment_seconds=segment_seconds,
+                                     hop_seconds=hop_seconds,
+                                     target_sr=target_sr,
+                                     device=device or "cpu"))
+
+    # MERT (may fail if nnAudio missing etc.) -> skip gracefully
+    try:
+        exts.append(MERTFeatureExtractor(segment_seconds=segment_seconds,
+                                         hop_seconds=hop_seconds,
+                                         target_sr=target_sr,
+                                         device=device or "cpu"))
+    except Exception as e:
+        warnings.warn(f"Skipping MERT: {e}")
+
+    return exts
+
+# Usage example:
+# files = ["song1.mp3", "song2.flac"]
+# extractors = build_windows_extractors(segment_seconds=30.0, hop_seconds=15.0)
+# multi = MultiModelAudioExtractor(extractors, combine="separate", segment_seconds=30.0, hop_seconds=15.0)
+# vecs, meta = multi.extract_features_with_metadata(files)
+# %%

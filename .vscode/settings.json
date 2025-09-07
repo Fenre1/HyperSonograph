@@ -1,4 +1,5 @@
 {
+  "python.defaultInterpreterPath": "C:\\Users\\Floris\\anaconda3\\envs\\HyperSonograph\\python.exe",
   "jupyter.notebookFileRoot": "${workspaceFolder}",
   "jupyter.runStartupCommands": "%cd \"${workspaceFolder}\""
 }
