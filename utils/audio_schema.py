@@ -59,12 +59,42 @@ class ModelFeatures:
 
     def get_song_segments(self, song: int) -> np.ndarray:
         """Return embeddings for all segments belonging to ``song``."""
-        raise NotImplementedError
+        mask = self.segments.song_id == song
+        return self.segments.embeddings[mask]
 
     def compare_segment_to_song(self, seg_vec: np.ndarray, song: int) -> float:
-        """Compare ``seg_vec`` to the centroid of ``song``."""
-        raise NotImplementedError
+        """Compare ``seg_vec`` to the centroid of ``song``.
+
+        Parameters
+        ----------
+        seg_vec:
+            The segment embedding vector to compare.
+        song:
+            Integer identifier of the target song.
+        Returns
+        -------
+        float
+            Cosine similarity between the segment vector and the song's centroid.
+        """
+        idx = np.where(self.songs.song_id == song)[0]
+        if idx.size == 0:
+            raise KeyError(f"Song id {song} not found")
+        centroid = self.songs.centroid[idx[0]]
+        seg = np.asarray(seg_vec, dtype=np.float32)
+        seg /= np.linalg.norm(seg) + 1e-8
+        cen = centroid.astype(np.float32)
+        cen /= np.linalg.norm(cen) + 1e-8
+        return float(np.dot(seg, cen))
 
     def compare_songs(self, song_a: int, song_b: int) -> float:
         """Compare two songs using their ``stats2D`` representations."""
-        raise NotImplementedError
+        idx_a = np.where(self.songs.song_id == song_a)[0]
+        idx_b = np.where(self.songs.song_id == song_b)[0]
+        if idx_a.size == 0 or idx_b.size == 0:
+            raise KeyError("Song id not found")
+        vec_a = self.songs.stats2D[idx_a[0]].astype(np.float32)
+        vec_b = self.songs.stats2D[idx_b[0]].astype(np.float32)
+        vec_a /= np.linalg.norm(vec_a) + 1e-8
+        vec_b /= np.linalg.norm(vec_b) + 1e-8
+        return float(np.dot(vec_a, vec_b))
+        

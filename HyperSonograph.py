@@ -31,7 +31,6 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QCheckBox,
     QHBoxLayout,
-    QComboBox
 )
  
 from PyQt5.QtGui import (
@@ -58,6 +57,7 @@ from utils.data_loader import (
 from utils.selection_bus import SelectionBus
 from utils.session_model import SessionModel, generate_n_colors
 from utils.audio_table import AudioTableDock
+from utils.audio_schema import SegmentLevel, SongLevel, ModelFeatures
 
 from utils.spatial_viewQv4 import SpatialViewQDock, HyperedgeItem
 from utils.feature_extraction import (
@@ -68,7 +68,10 @@ from utils.feature_extraction import (
 from utils.file_utils import get_audio_files
 from utils.session_stats import show_session_stats
 from utils.metadata_overview import show_metadata_overview
+from utils.hyperedge_matrix2 import HyperedgeMatrixDock
+
 from clustering.temi_clustering import temi_cluster
+
 import pyqtgraph as pg
 try:
     import darkdetect
@@ -171,7 +174,7 @@ class NewSessionDialog(QDialog):
 
         layout = QVBoxLayout(self)
         info = QLabel(
-            f"Found {image_count} images.\n\n"
+            f"Found {image_count} audio files.\n\n"
             "Feature extraction and clustering will be performed to generate "
             "the hypergraph. This may take a couple of minutes."
         )
@@ -195,14 +198,12 @@ class NewSessionDialog(QDialog):
         self.jacc_edit = QLineEdit(str(JACCARD_PRUNE_DEFAULT))
         layout.addWidget(self.jacc_edit)
 
-        layout.addWidget(QLabel("Clustering algorithm:"))
-        self.alg_combo = QComboBox()
-        self.alg_combo.addItems(["TEMI", "Fuzzy C-Means"])
-        layout.addWidget(self.alg_combo)
-
-        layout.addWidget(QLabel("Fuzzy C-Means m:"))
-        self.m_edit = QLineEdit("1.1")
-        layout.addWidget(self.m_edit)
+        self.clap_cb = QCheckBox("Include CLAP model")
+        self.mert_cb = QCheckBox("Include MERT model")
+        self.openl3_cb = QCheckBox("Include OpenL3 model")
+        layout.addWidget(self.clap_cb)
+        layout.addWidget(self.mert_cb)
+        layout.addWidget(self.openl3_cb)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("Start generating hypergraph")
@@ -210,13 +211,19 @@ class NewSessionDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def parameters(self) -> tuple[int, float, float, str, float]:
+    def parameters(self) -> tuple[int, float, float, list[str]]:
+        models: list[str] = []
+        if self.clap_cb.isChecked():
+            models.append("CLAP")
+        if self.mert_cb.isChecked():
+            models.append("MERT")
+        if self.openl3_cb.isChecked():
+            models.append("OpenL3")
         return (
             int(self.edge_edit.text()),
             float(self.thr_edit.text()),
             float(self.jacc_edit.text()),
-            self.alg_combo.currentText(),
-            float(self.m_edit.text()),
+            models,
         )
 
 class ReconstructDialog(QDialog):
@@ -753,7 +760,8 @@ class MainWin(QMainWindow):
         self.temi_results = {}
         self.audio_files: list[str] = []
         self.features: dict[str, np.ndarray] = {}
-
+        self._model_names: list[str] = []
+        self._model_features: dict[str, ModelFeatures] = {}
         self.slider.valueChanged.connect(self.regroup)
 
 
@@ -961,7 +969,7 @@ class MainWin(QMainWindow):
 
     def new_session(self):
         directory = QFileDialog.getExistingDirectory(
-            self, "Select image folder", str(DATA_DIRECTORY)
+            self, "Select audio folder", str(DATA_DIRECTORY)
         )
         if not directory:
             return
@@ -969,7 +977,7 @@ class MainWin(QMainWindow):
         files = get_audio_files(directory)
         if not files:
             QMessageBox.information(
-                self, "No Images", "No supported image files found."
+                self, "No Audio", "No supported audio files found."
             )
             return
 
@@ -977,43 +985,61 @@ class MainWin(QMainWindow):
         if dlg.exec_() != QDialog.Accepted:
             return
         try:
-            n_edges, thr, prune_thr, algo, m_val = dlg.parameters()
+            n_edges, thr, prune_thr, models = dlg.parameters()
         except Exception:
             QMessageBox.warning(self, "Invalid Input", "Enter valid numbers.")
             return
+        if not models:
+            QMessageBox.warning(self, "No Model", "Select at least one model.")
+            return
+
 
         app = QApplication.instance()
         if app:
             app.setOverrideCursor(Qt.WaitCursor)
         try:
-            extractor = Swinv2LargeFeatureExtractor()
-            features = extractor.extract_features(files)
-            oc_extractor = OpenClipFeatureExtractor()
-            oc_features = oc_extractor.extract_features(files)
-            plc_extractor = DenseNet161Places365FeatureExtractor()
-            plc_features = plc_extractor.extract_features(files)
-            if algo == "Fuzzy C-Means":
-                matrix, _ = fuzzy_cmeans_cluster(features, n_edges, thr, m_val)
-                oc_matrix, _ = fuzzy_cmeans_cluster(oc_features, n_edges, thr, m_val)
-                plc_matrix, _ = fuzzy_cmeans_cluster(plc_features, n_edges, thr, m_val)
-            else:
-                matrix, _ = temi_cluster(features, out_dim=n_edges, threshold=thr)
-                oc_matrix, _ = temi_cluster(oc_features, out_dim=n_edges, threshold=thr)
-                plc_matrix, _ = temi_cluster(plc_features, out_dim=n_edges, threshold=thr)
-            empty_cols = np.where(matrix.sum(axis=0) == 0)[0]
-            if len(empty_cols) > 0:
-                matrix = np.delete(matrix, empty_cols, axis=1)
-                QMessageBox.information(
-                    self,
-                    "Empty Hyperedges Removed",
-                    f"{len(empty_cols)} empty hyperedges were removed after clustering."
+            matrices: dict[str, np.ndarray] = {}
+            features_by_model: dict[str, np.ndarray] = {}
+            model_feats: dict[str, ModelFeatures] = {}
+            file_index = {f: i for i, f in enumerate(files)}
+            for name in models:
+                if name == "CLAP":
+                    ext = CLAPFeatureExtractor()
+                elif name == "MERT":
+                    ext = MERTFeatureExtractor()
+                else:
+                    ext = OpenL3FeatureExtractor()
+                Xseg, rows, songs = ext.extract_segments_and_songs(files)
+                seg_song_ids = np.array([file_index[r["file"]] for r in rows], dtype=np.int32)
+                segs = SegmentLevel(
+                    embeddings=Xseg,
+                    song_id=seg_song_ids,
+                    start_s=np.array([r["start_s"] for r in rows], dtype=np.float32),
+                    end_s=np.array([r["end_s"] for r in rows], dtype=np.float32),
                 )
-            oc_empty = np.where(oc_matrix.sum(axis=0) == 0)[0]
-            if len(oc_empty) > 0:
-                oc_matrix = np.delete(oc_matrix, oc_empty, axis=1)
-            plc_empty = np.where(plc_matrix.sum(axis=0) == 0)[0]
-            if len(plc_empty) > 0:
-                plc_matrix = np.delete(plc_matrix, plc_empty, axis=1)                
+                centroids = np.vstack([s.centroid_D for s in songs]) if songs else np.zeros((0, ext.output_dim()))
+                stats = np.vstack([s.stats_2D for s in songs]) if songs else np.zeros((0, 2 * ext.output_dim()))
+                song_level = SongLevel(
+                    centroid=centroids,
+                    stats2D=stats,
+                    song_id=np.arange(len(files)),
+                    path=files,
+                )
+                mf = ModelFeatures(name=name, segments=segs, songs=song_level)
+                model_feats[name] = mf
+                feats = song_level.stats2D
+                features_by_model[name] = feats
+                matrix, _ = temi_cluster(feats, out_dim=n_edges, threshold=thr)
+                empty = np.where(matrix.sum(axis=0) == 0)[0]
+                if len(empty) > 0:
+                    matrix = np.delete(matrix, empty, axis=1)
+                    if name == models[0]:
+                        QMessageBox.information(
+                            self,
+                            "Empty Hyperedges Removed",
+                            f"{len(empty)} empty hyperedges were removed after clustering.",
+                        )
+                matrices[name] = matrix
         except Exception as e:
             if app:
                 app.restoreOverrideCursor()
@@ -1022,6 +1048,14 @@ class MainWin(QMainWindow):
         if app:
             app.restoreOverrideCursor()
 
+        matrix = matrices[models[0]]
+        features = features_by_model[models[0]]
+        oc_matrix = matrices.get(models[1]) if len(models) > 1 else np.array([])
+        oc_features = features_by_model.get(models[1]) if len(models) > 1 else None
+        plc_matrix = matrices.get(models[2]) if len(models) > 2 else np.array([])
+        plc_features = features_by_model.get(models[2]) if len(models) > 2 else None
+        self._model_features = model_feats
+        self._model_names = models
         df = pd.DataFrame(matrix.astype(int), columns=[f"edge_{i}" for i in range(matrix.shape[1])])
 
         if self.model:
@@ -1047,9 +1081,11 @@ class MainWin(QMainWindow):
             places365_features=plc_features,
         )
         if oc_matrix.size:
-            self.model.append_clustering_matrix(oc_matrix, origin="openclip", prefix="clip")
+            origin = models[1].lower()
+            self.model.append_clustering_matrix(oc_matrix, origin=origin, prefix=origin)
         if plc_matrix.size:
-            self.model.append_clustering_matrix(plc_matrix, origin="places365", prefix="plc365")
+            origin = models[2].lower()
+            self.model.append_clustering_matrix(plc_matrix, origin=origin, prefix=origin)
         self.model.prune_similar_edges(prune_thr)
 
 
@@ -1059,7 +1095,7 @@ class MainWin(QMainWindow):
         self.model.hyperedgeModified.connect(self._on_model_hyperedge_modified)
 
         self.audio_table.clear()
-        for name in ["CLAP", "MERT", "OpenL3"]:
+        for name in self._model_names:
             self.audio_table.add_model(name, self.model)
         self.audio_table.set_use_full_images(True)
         self.thumb_toggle_act.setChecked(True)
@@ -1091,34 +1127,7 @@ class MainWin(QMainWindow):
                     pass
 
             self.model = SessionModel.load_h5(path)
-            if self.model.openclip_features is None:
-                oc_extractor = OpenClipFeatureExtractor()
-                self.model.openclip_features = oc_extractor.extract_features(self.model.im_list)
-            if self.model.places365_features is None:
-                plc_extractor = DenseNet161Places365FeatureExtractor()
-                self.model.places365_features = plc_extractor.extract_features(self.model.im_list)                
-            if all(orig != "openclip" for orig in self.model.edge_origins.values()):
-                n_edges = len(self.model.cat_list)
-                oc_matrix, _ = temi_cluster(
-                    self.model.openclip_features,
-                    out_dim=n_edges,
-                    threshold=THRESHOLD_DEFAULT,
-                )
-                oc_empty = np.where(oc_matrix.sum(axis=0) == 0)[0]
-                if len(oc_empty) > 0:
-                    oc_matrix = np.delete(oc_matrix, oc_empty, axis=1)
-                self.model.append_clustering_matrix(oc_matrix, origin="openclip", prefix="clip")
-            if all(orig != "places365" for orig in self.model.edge_origins.values()):
-                n_edges = len(self.model.cat_list)
-                plc_matrix, _ = temi_cluster(
-                    self.model.places365_features,
-                    out_dim=n_edges,
-                    threshold=THRESHOLD_DEFAULT,
-                )
-                plc_empty = np.where(plc_matrix.sum(axis=0) == 0)[0]
-                if len(plc_empty) > 0:
-                    plc_matrix = np.delete(plc_matrix, plc_empty, axis=1)
-                self.model.append_clustering_matrix(plc_matrix, origin="places365", prefix="plc365")
+            self._model_names = ["CLAP", "MERT", "OpenL3"]
 
             self.model.layoutChanged.connect(self.regroup)
             self._overview_triplets = None
@@ -1191,8 +1200,8 @@ class MainWin(QMainWindow):
             app.setOverrideCursor(Qt.WaitCursor)
         try:
             features = self.model.features
-            oc_feats = self.model.openclip_features
-            plc_feats = self.model.places365_features
+            oc_feats = self.model.openclip_features if len(self._model_names) > 1 else None
+            plc_feats = self.model.places365_features if len(self._model_names) > 2 else None
 
             matrix, _ = temi_cluster(features, out_dim=n_edges, threshold=thr)
             oc_matrix = None
@@ -1254,9 +1263,12 @@ class MainWin(QMainWindow):
         )
 
         if oc_matrix is not None and oc_matrix.size:
-            self.model.append_clustering_matrix(oc_matrix, origin="openclip", prefix="clip")
+            origin = self._model_names[1].lower()
+            self.model.append_clustering_matrix(oc_matrix, origin=origin, prefix=origin)
+
         if plc_matrix is not None and plc_matrix.size:
-            self.model.append_clustering_matrix(plc_matrix, origin="places365", prefix="plc365")
+            origin = self._model_names[2].lower()
+            self.model.append_clustering_matrix(plc_matrix, origin=origin, prefix=origin)
         self.model.prune_similar_edges(prune_thr)
 
         self.model.layoutChanged.connect(self.regroup)
@@ -1265,7 +1277,7 @@ class MainWin(QMainWindow):
         self.model.hyperedgeModified.connect(self._on_model_hyperedge_modified)
 
         self.audio_table.clear()
-        for name in ["CLAP", "MERT", "OpenL3"]:
+        for name in self._model_names:
             self.audio_table.add_model(name, self.model)
         self.audio_table.set_use_full_images(True)
         self.thumb_toggle_act.setChecked(True)
