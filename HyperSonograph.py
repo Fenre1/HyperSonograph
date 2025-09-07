@@ -6,7 +6,6 @@ from utils.similarity import SIM_METRIC
 from pathlib import Path
 import io
 import torch
-from PIL import Image, ImageGrab
 import time
 import pyqtgraph as pg
 from PyQt5.QtWidgets import (
@@ -58,10 +57,8 @@ from utils.data_loader import (
 )
 from utils.selection_bus import SelectionBus
 from utils.session_model import SessionModel, generate_n_colors
-# from utils.image_grid import ImageGridDock
-# from utils.overlap_list_dock import OverlapListDock
-# from utils.hyperedge_matrix2 import HyperedgeMatrixDock
-# from utils.spatial_viewQv3 import SpatialViewQDock
+from utils.audio_table import AudioTableDock
+
 from utils.spatial_viewQv4 import SpatialViewQDock, HyperedgeItem
 from utils.feature_extraction import (
     CLAPFeatureExtractor,
@@ -72,7 +69,6 @@ from utils.file_utils import get_audio_files
 from utils.session_stats import show_session_stats
 from utils.metadata_overview import show_metadata_overview
 from clustering.temi_clustering import temi_cluster
-from clustering.fuzzy_cmeans import fuzzy_cmeans_cluster
 import pyqtgraph as pg
 try:
     import darkdetect
@@ -555,8 +551,8 @@ class MainWin(QMainWindow):
         self._overview_triplets = None
         self.temi_results = {}
         self.bus = SelectionBus()
-        self.bus.edgesChanged.connect(self._update_bus_images)
-        #self.bus.edgesChanged.connect(print)
+        # self.bus.edgesChanged.connect(self._update_bus_images)
+
         self.bus.edgesChanged.connect(self._remember_last_edge)
 
         self._last_edge = None
@@ -609,33 +605,9 @@ class MainWin(QMainWindow):
         self.btn_del_hyperedge = QPushButton("Delete Hyperedge")
         self.btn_del_hyperedge.clicked.connect(self.on_delete_hyperedge)
 
-        self.btn_add_img = QPushButton("Add images to hyperedge")
-        self.btn_add_img.clicked.connect(self.add_selection_to_hyperedge)
-        
-        self.btn_del_img = QPushButton("Remove images from hyperedge")
-        self.btn_del_img.clicked.connect(self.on_remove_images)
-
-        self.btn_rank = QPushButton("Rank images by selection")
-        self.btn_rank.clicked.connect(self.rank_selected_images)
-
-        self.btn_rank_edge = QPushButton("Rank images by hyperedge")
-        self.btn_rank_edge.clicked.connect(self.rank_selected_hyperedge)
-
-        self.btn_rank_file = QPushButton("Rank external image")
-        self.btn_rank_file.clicked.connect(self.rank_image_file)
-
-        self.btn_rank_clip = QPushButton("Rank clipboard image")
-        self.btn_rank_clip.clicked.connect(self.rank_clipboard_image)
 
         self.btn_overview = QPushButton("Overview")
         self.btn_overview.clicked.connect(self.show_overview)
-
-        self.text_query = QLineEdit()
-        self.text_query.setPlaceholderText("Text query…")
-        self.text_query.returnPressed.connect(self.rank_text_query)
-
-        self.btn_rank_text = QPushButton("Rank by text")
-        self.btn_rank_text.clicked.connect(self.rank_text_query)
 
         self.btn_meta_overview = QPushButton("Metadata overview")
         self.btn_meta_overview.clicked.connect(self.show_metadata_overview)
@@ -674,17 +646,11 @@ class MainWin(QMainWindow):
         toolbar_layout.addWidget(self.btn_sim)
         toolbar_layout.addWidget(self.btn_add_hyperedge)
         toolbar_layout.addWidget(self.btn_del_hyperedge)
-        toolbar_layout.addWidget(self.btn_add_img)
-        toolbar_layout.addWidget(self.btn_del_img)
-        toolbar_layout.addWidget(self.btn_rank)        
-        toolbar_layout.addWidget(self.btn_rank_edge)
-        toolbar_layout.addWidget(self.btn_rank_file)
-        toolbar_layout.addWidget(self.btn_rank_clip)
+
         toolbar_layout.addWidget(self.btn_overview)
         toolbar_layout.addWidget(self.btn_session_stats)
         toolbar_layout.addWidget(self.btn_manage_visibility)        
-        toolbar_layout.addWidget(self.text_query)
-        toolbar_layout.addWidget(self.btn_rank_text)
+
         toolbar_layout.addWidget(self.btn_meta_overview)
         toolbar_layout.addWidget(self.btn_color_default)
         toolbar_layout.addWidget(self.btn_color_status)
@@ -700,18 +666,15 @@ class MainWin(QMainWindow):
         self.legend_box.hide()
         toolbar_layout.addWidget(self.legend_box)
 
-        self.image_grid = ImageGridDock(self.bus, self)
-        self.overlap_dock = OverlapListDock(self.bus, self.image_grid, self)
-        self.overlap_dock.setObjectName("OverlapListDock")        
-        toolbar_layout.addWidget(self.image_grid.hide_selected_cb)
-        toolbar_layout.addWidget(self.image_grid.hide_modified_cb)
+        self.audio_table = AudioTableDock(self.bus, self)
+        toolbar_layout.addWidget(self.audio_table.hide_selected_cb)
+        toolbar_layout.addWidget(self.audio_table.hide_modified_cb)
 
         toolbar_layout.addStretch()
         self.toolbar_dock.setWidget(toolbar_container)
 
-        # --- Image Grid ---
-        self.image_grid.setObjectName("ImageGridDock") # Use object name for clarity
-        self.image_grid.labelDoubleClicked.connect(lambda name: self.bus.set_edges([name]))
+        self.audio_table.setObjectName("AudioTableDock")
+
         # --- Spatial View ---
         self.spatial_dock = SpatialViewQDock(self.bus, self)
         self.spatial_dock.setObjectName("SpatialViewDock")
@@ -747,9 +710,8 @@ class MainWin(QMainWindow):
         self.addDockWidget(Qt.LeftDockWidgetArea, self.toolbar_dock)
 
         # 3. Add the "Image grid" to the right area. It will take up the remaining space.
-        self.addDockWidget(Qt.RightDockWidgetArea, self.image_grid)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.overlap_dock)
-        self.splitDockWidget(self.image_grid, self.overlap_dock, Qt.Horizontal)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.audio_table)
+
         # 4. Add the "Spatial view" below the "Image grid".
         self.addDockWidget(Qt.RightDockWidgetArea, self.spatial_dock)
 
@@ -757,8 +719,7 @@ class MainWin(QMainWindow):
         self.splitDockWidget(self.spatial_dock, self.matrix_dock, Qt.Horizontal)
 
         # Optional: Set initial relative sizes of the docks
-        self.resizeDocks([self.tree_dock, self.image_grid], [300, 850], Qt.Horizontal)
-        self.resizeDocks([self.image_grid, self.overlap_dock], [700, 200], Qt.Horizontal)
+        self.resizeDocks([self.tree_dock, self.audio_table], [300, 850], Qt.Horizontal)
         self.resizeDocks([self.tree_dock, self.toolbar_dock], [550, 250], Qt.Vertical)
         self.resizeDocks([self.spatial_dock, self.matrix_dock], [450, 450], Qt.Horizontal)
 
@@ -900,184 +861,6 @@ class MainWin(QMainWindow):
         if res == QMessageBox.Yes:
             self.model.delete_hyperedge(name)
 
-    def on_remove_images(self):
-        if not self.model:
-            QMessageBox.warning(self, "No Session", "Please load a session first.")
-            return
-
-        if not self.image_grid.view.model():
-            QMessageBox.warning(self, "No Images", "No images are currently displayed.")
-            return
-
-        sel_indexes = self.image_grid.view.selectionModel().selectedIndexes()
-        if not sel_indexes:
-            QMessageBox.warning(self, "No Selection", "Select images to remove first.")
-            return
-
-        model = self.image_grid.view.model()
-        img_idxs = [model._indexes[i.row()] for i in sel_indexes]
-
-        possible_edges = sorted(
-            {e for idx in img_idxs for e in self.model.image_mapping.get(idx, set())}
-        )
-        if not possible_edges:
-            QMessageBox.information(
-                self,
-                "Not in Hyperedge",
-                "Selected images are not assigned to any hyperedge.",
-            )
-            return
-
-        dialog = _MultiSelectDialog(possible_edges, self)
-        if dialog.exec() != QDialog.Accepted:
-            return
-        edges = dialog.chosen()
-        if not edges:
-            return
-
-        self.model.remove_images_from_edges(img_idxs, edges)
-        # refresh displayed images of current selection
-        self._update_bus_images(self.image_grid._selected_edges)
-
-
-
-    def rank_selected_images(self):
-        """Rank all images by similarity to the currently selected images."""
-        if not self.model:
-            QMessageBox.warning(self, "No Session", "Please load a session first.")
-            return
-
-        model = self.image_grid.view.model()
-        sel = self.image_grid.view.selectionModel().selectedRows() if model else []
-        if not sel:
-            QMessageBox.information(self, "No Selection", "Select images in the grid first.")
-            return
-
-        sel_idxs = [model._indexes[i.row()] for i in sel]
-        feats = self.model.features
-        ref = feats[sel_idxs].mean(axis=0, keepdims=True)
-        sims = SIM_METRIC(ref, feats)[0]
-        ranked = np.argsort(sims)[::-1]
-        ranked = [i for i in ranked if i not in sel_idxs][:500]
-        final_idxs = sel_idxs + ranked
-        self.image_grid.update_images(
-            final_idxs, highlight=sel_idxs, sort=False, query=True
-        )
-
-    def rank_selected_hyperedge(self):
-        """Rank all images by similarity to the selected hyperedge."""
-        if not self.model:
-            QMessageBox.warning(self, "No Session", "Please load a session first.")
-            return
-
-        model = self.tree.model()
-        sel = self.tree.selectionModel().selectedRows(0) if model else []
-        if not sel:
-            QMessageBox.information(self, "No Selection", "Select a hyperedge in the tree first.")
-            return
-
-        item = self._item_from_index(sel[0])
-        if item.hasChildren():
-            QMessageBox.information(self, "Invalid Selection", "Please select a single hyperedge, not a group.")
-            return
-
-        name = item.text()
-        if name not in self.model.hyperedges:
-            QMessageBox.information(self, "Unknown Hyperedge", "Selected item is not a hyperedge.")
-            return
-
-        ref = self.model.hyperedge_avg_features.get(name)
-        feats = self.model.features
-        sims = SIM_METRIC(ref.reshape(1, -1), feats)[0]
-        ranked = np.argsort(sims)[::-1]
-        exclude = self.model.hyperedges[name]
-        ranked = [i for i in ranked if i not in exclude][:500]
-        self.image_grid.update_images(ranked, sort=False, query=True)
-
-    def rank_image_file(self):
-        """Rank all session images against a user chosen image file."""
-        if not self.model:
-            QMessageBox.warning(self, "No Session", "Please load a session first.")
-            return
-
-        file, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select image file",
-            str(DATA_DIRECTORY),
-            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.tiff);;All Files (*)",
-        )
-        if not file:
-            return
-
-        try:
-            if not hasattr(self, "_ext_feature_extractor"):
-                self._ext_feature_extractor = Swinv2LargeFeatureExtractor(batch_size=1)
-            vec = self._ext_feature_extractor.extract_features([file])[0]
-        except Exception as e:
-            QMessageBox.critical(self, "Feature Error", str(e))
-            return
-
-        feats = self.model.features
-        sims = SIM_METRIC(vec.reshape(1, -1), feats)[0]
-        ranked = np.argsort(sims)[::-1][:500]
-        self.image_grid.update_images(list(ranked), sort=False, query=True)
-
-    def rank_clipboard_image(self):
-        """Rank images by similarity to the image currently in the clipboard."""
-        if not self.model:
-            QMessageBox.warning(self, "No Session", "Please load a session first.")
-            return
-        try:
-            clip_img = ImageGrab.grabclipboard()
-        except Exception as e:
-            QMessageBox.critical(self, "Clipboard Error", str(e))
-            return
-
-        if clip_img is None:
-            QMessageBox.information(self, "No Image", "No image in clipboard.")
-            return
-
-        if isinstance(clip_img, list):
-            try:
-                clip_img = Image.open(clip_img[0])
-            except Exception:
-                QMessageBox.information(self, "No Image", "Clipboard does not contain an image.")
-                return
-
-        if clip_img.mode == "RGBA":
-            clip_img = clip_img.convert("RGB")
-
-        if self._clip_extractor is None:
-            self._clip_extractor = Swinv2LargeFeatureExtractor(batch_size=1)
-
-        tensor = self._clip_extractor.transform(clip_img).unsqueeze(0).to(self._clip_extractor.device)
-        with torch.no_grad():
-            feat = self._clip_extractor.model(tensor).cpu().numpy()[0]
-
-        feats = self.model.features
-        sims = SIM_METRIC(feat.reshape(1, -1), feats)[0]
-        ranked = np.argsort(sims)[::-1][:500]
-        self.image_grid.update_images(ranked, sort=False, query=True)
-
-    def rank_text_query(self):
-        """Rank images by similarity to a text query using OpenCLIP."""
-        if not self.model:
-            QMessageBox.warning(self, "No Session", "Please load a session first.")
-            return
-        text = self.text_query.text().strip()
-        if not text:
-            QMessageBox.information(self, "No Text", "Enter a text query first.")
-            return
-        if self.model.openclip_features is None:
-            QMessageBox.warning(self, "No Features", "Session lacks OpenCLIP features.")
-            return
-        if self._openclip_extractor is None:
-            self._openclip_extractor = OpenClipFeatureExtractor(batch_size=1)
-        vec = self._openclip_extractor.encode_text([text])[0]
-        feats = self.model.openclip_features
-        sims = SIM_METRIC(vec.reshape(1, -1), feats)[0]
-        ranked = np.argsort(sims)[::-1][:500]
-        self.image_grid.update_images(list(ranked), sort=False, query=True)
 
     def show_overview(self):
         """Display triplet overview on the image grid."""
@@ -1086,7 +869,8 @@ class MainWin(QMainWindow):
             return
         if self._overview_triplets is None:
             self._overview_triplets = self._compute_overview_triplets()
-        self.image_grid.show_overview(self._overview_triplets, self.model)
+        self.audio_table.show_overview(self._overview_triplets, self.model)
+
 
     def show_metadata_overview(self):
         """Show a summary of all metadata in a popup window."""
@@ -1173,30 +957,6 @@ class MainWin(QMainWindow):
 
     # ------------------------------------------------------------------
 
-
-    def add_selection_to_hyperedge(self):
-        """Add currently selected images in the grid to a chosen hyperedge."""
-        if not self.model:
-            QMessageBox.warning(self, "No Session", "Please load a session first.")
-            return
-
-        model = self.image_grid.view.model()
-        sel = self.image_grid.view.selectionModel().selectedRows() if model else []
-        if not sel:
-            QMessageBox.information(self, "No Selection", "Select images in the grid first.")
-            return
-
-        img_idxs = [model._indexes[i.row()] for i in sel]
-
-        dialog = HyperedgeSelectDialog(list(self.model.hyperedges), self)
-        if dialog.exec_() != QDialog.Accepted:
-            return
-        name = dialog.selected_name()
-        if not name:
-            QMessageBox.information(self, "No Hyperedge", "No hyperedge selected.")
-            return
-
-        self.model.add_images_to_hyperedge(name, img_idxs)
 
 
     def new_session(self):
@@ -1298,10 +1058,11 @@ class MainWin(QMainWindow):
         self.model.layoutChanged.connect(self._on_layout_changed)
         self.model.hyperedgeModified.connect(self._on_model_hyperedge_modified)
 
-        self.image_grid.set_model(self.model)
-        self.image_grid.set_use_full_images(True)
+        self.audio_table.clear()
+        for name in ["CLAP", "MERT", "OpenL3"]:
+            self.audio_table.add_model(name, self.model)
+        self.audio_table.set_use_full_images(True)
         self.thumb_toggle_act.setChecked(True)
-        self.overlap_dock.set_model(self.model)        
         self.matrix_dock.set_model(self.model)
         self.spatial_dock.set_model(self.model)
         self.regroup()
@@ -1503,17 +1264,15 @@ class MainWin(QMainWindow):
         self.model.layoutChanged.connect(self._on_layout_changed)
         self.model.hyperedgeModified.connect(self._on_model_hyperedge_modified)
 
-        self.image_grid.set_model(self.model)
-        if self.model.thumbnail_data:
-            self.image_grid.set_use_full_images(False)
-            self.thumb_toggle_act.setChecked(False)
-        else:
-            self.image_grid.set_use_full_images(True)
-            self.thumb_toggle_act.setChecked(True)
-        self.overlap_dock.set_model(self.model)
+        self.audio_table.clear()
+        for name in ["CLAP", "MERT", "OpenL3"]:
+            self.audio_table.add_model(name, self.model)
+        self.audio_table.set_use_full_images(True)
+        self.thumb_toggle_act.setChecked(True)
         self.matrix_dock.set_model(self.model)
         self.spatial_dock.set_model(self.model)
         self.regroup()
+
 
 
     def _on_layout_changed(self):
@@ -1531,7 +1290,7 @@ class MainWin(QMainWindow):
         print('_apply_layout_change',time.perf_counter() - start_timer13)
 
     def toggle_full_images(self, flag: bool) -> None:
-        self.image_grid.set_use_full_images(flag)
+        self.audio_table.set_use_full_images(flag)
 
     def _on_model_hyperedge_modified(self, _name: str):
         self._skip_next_layout = True
