@@ -12,6 +12,7 @@ from PyQt5.QtGui import QColor
 import pyqtgraph as pg
 import time
 from .similarity import SIM_METRIC
+from .audio_schema import SegmentLevel, SongLevel, ModelFeatures
 
 def generate_n_colors(n: int, saturation: int = 150, value: int = 230) -> list[str]:
     colors: list[str] = []
@@ -104,6 +105,31 @@ class SessionModel(QObject):
 
             seen_raw = hdf["edge_seen_times"][()] if "edge_seen_times" in hdf else None
 
+            model_names: List[str] = []
+            model_feats: dict[str, ModelFeatures] = {}
+            if "audio_model_names" in hdf:
+                names_raw = hdf["audio_model_names"][()]
+                model_names = [n.decode() if isinstance(n, bytes) else str(n) for n in names_raw]
+            if "audio_model_features" in hdf:
+                grp = hdf["audio_model_features"]
+                for name in grp:
+                    g = grp[name]
+                    segs = SegmentLevel(
+                        embeddings=g["segment_embeddings"][()],
+                        song_id=g["segment_song_id"][()].astype(np.int32),
+                        start_s=g["segment_start_s"][()].astype(np.float32),
+                        end_s=g["segment_end_s"][()].astype(np.float32),
+                    )
+                    songs = SongLevel(
+                        centroid=g["song_centroid"][()],
+                        stats2D=g["song_stats2D"][()],
+                        song_id=g["song_song_id"][()].astype(np.int32),
+                        path=[p.decode() if isinstance(p, bytes) else str(p) for p in g["song_path"][()]],
+                    )
+                    model_feats[name] = ModelFeatures(name=name, segments=segs, songs=songs)
+                if not model_names:
+                    model_names = list(grp.keys())
+
         return cls(
             im_list,
             df_edges,
@@ -116,8 +142,10 @@ class SessionModel(QObject):
             thumbnail_data=thumbnail_data,
             thumbnails_are_embedded=thumbnails_embedded,
             edge_origins=edge_orig,
-            edge_last_seen=seen_raw,            
+            edge_last_seen=seen_raw,
             metadata=metadata_df,
+            model_features=model_feats,
+            model_names=model_names,
         )
 
 
@@ -171,6 +199,30 @@ class SessionModel(QObject):
                     "places365_features", data=self.places365_features, dtype="f4"
                 )
             print('saved places365_features')
+
+            if getattr(self, "model_names", None):
+                hdf.create_dataset(
+                    "audio_model_names",
+                    data=np.array(self.model_names, dtype=object),
+                    dtype=dt,
+                )
+            if getattr(self, "model_features", None):
+                grp = hdf.create_group("audio_model_features")
+                for name, mf in self.model_features.items():
+                    g = grp.create_group(name)
+                    segs = mf.segments
+                    g.create_dataset("segment_embeddings", data=segs.embeddings, dtype="f4")
+                    g.create_dataset("segment_song_id", data=segs.song_id, dtype="i4")
+                    g.create_dataset("segment_start_s", data=segs.start_s, dtype="f4")
+                    g.create_dataset("segment_end_s", data=segs.end_s, dtype="f4")
+                    songs = mf.songs
+                    g.create_dataset("song_centroid", data=songs.centroid, dtype="f4")
+                    g.create_dataset("song_stats2D", data=songs.stats2D, dtype="f4")
+                    g.create_dataset("song_song_id", data=songs.song_id, dtype="i4")
+                    g.create_dataset(
+                        "song_path", data=np.array(list(songs.path), dtype=object), dtype=dt
+                    )
+
             if self.umap_embedding is not None:
                 hdf.create_dataset(
                     "umap_embedding", data=self.umap_embedding, dtype="f4"
@@ -233,8 +285,10 @@ class SessionModel(QObject):
                  thumbnail_data: Optional[List[bytes] | List[str]] = None,
                  thumbnails_are_embedded: bool = True,
                  edge_origins: Optional[List[str]] | None = None,
-                 edge_last_seen: Optional[List[float]] | None = None,                 
-                 metadata: pd.DataFrame | None = None):
+                 edge_last_seen: Optional[List[float]] | None = None,
+                 metadata: pd.DataFrame | None = None,
+                 model_features: dict[str, ModelFeatures] | None = None,
+                 model_names: List[str] | None = None):
         super().__init__()
         self.im_list  = im_list                              # list[str]
         self.cat_list = list(df_edges.columns)               # list[str]
@@ -280,6 +334,9 @@ class SessionModel(QObject):
         
         self.thumbnail_data: Optional[List[bytes] | List[str]] = thumbnail_data
         self.thumbnails_are_embedded: bool = thumbnails_are_embedded
+
+        self.model_features: dict[str, ModelFeatures] = model_features or {}
+        self.model_names: List[str] = model_names or list(self.model_features.keys())
 
         self.overview_triplets: Dict[str, tuple[int | None, ...]] | None = None
         self.compute_overview_triplets()

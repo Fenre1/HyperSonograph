@@ -61,6 +61,7 @@ from utils.audio_schema import SegmentLevel, SongLevel, ModelFeatures
 
 from utils.spatial_viewQv4 import SpatialViewQDock, HyperedgeItem
 from utils.feature_extraction import (
+    AudioFeatureExtractorBase,    
     CLAPFeatureExtractor,
     MERTFeatureExtractor,
     OpenL3FeatureExtractor,
@@ -785,7 +786,21 @@ class MainWin(QMainWindow):
             self.process_audio_files(files)
 
     def process_audio_files(self, files: list[str]) -> None:
-        extractors = []
+        """Import additional audio files into the current session.
+
+        This performs feature extraction at both the segment and song level for
+        all available models. The resulting :class:`ModelFeatures` objects are
+        appended to ``_model_features`` and the hypergraph is reconstructed so
+        that the UI reflects the newly added songs.
+        """
+
+        if not self.model:
+            QMessageBox.warning(
+                self, "No Session", "Please load or create a session first."
+            )
+            return
+
+        extractors: list[AudioFeatureExtractorBase] = []
         try:
             extractors.append(CLAPFeatureExtractor())
         except Exception:
@@ -799,24 +814,185 @@ class MainWin(QMainWindow):
         except Exception:
             pass
         if not extractors:
-            QMessageBox.warning(self, "No Models", "No audio feature extractors available.")
+            QMessageBox.warning(
+                self, "No Models", "No audio feature extractors available."
+            )
             return
+
+        start_idx = len(self.model.im_list)
+        file_index = {f: start_idx + i for i, f in enumerate(files)}
+
         for ext in extractors:
-            vecs, meta = ext.extract_features_with_metadata(files)
-            per_file: dict[str, list[np.ndarray]] = {}
-            for v, m in zip(vecs, meta):
-                per_file.setdefault(m["file"], []).append(v)
-            ordered = []
-            for f in files:
-                segs = per_file.get(f)
-                if segs:
-                    ordered.append(np.mean(segs, axis=0))
-            new_vecs = np.vstack(ordered) if ordered else np.zeros((0, ext.output_dim()), dtype=np.float32)
-            if ext.model_name in self.features:
-                self.features[ext.model_name] = np.vstack([self.features[ext.model_name], new_vecs])
+            Xseg, rows, songs = ext.extract_segments_and_songs(files)
+
+            seg_song_ids = np.array(
+                [file_index[r["file"]] for r in rows], dtype=np.int32
+            )
+            segs = SegmentLevel(
+                embeddings=Xseg,
+                song_id=seg_song_ids,
+                start_s=np.array([r["start_s"] for r in rows], dtype=np.float32),
+                end_s=np.array([r["end_s"] for r in rows], dtype=np.float32),
+            )
+            centroids = (
+                np.vstack([s.centroid_D for s in songs])
+                if songs
+                else np.zeros((0, ext.output_dim()))
+            )
+            stats = (
+                np.vstack([s.stats_2D for s in songs])
+                if songs
+                else np.zeros((0, 2 * ext.output_dim()))
+            )
+            song_ids = np.array(
+                [file_index[s.file] for s in songs], dtype=np.int32
+            )
+            paths = [s.file for s in songs]
+            song_level = SongLevel(
+                centroid=centroids,
+                stats2D=stats,
+                song_id=song_ids,
+                path=paths,
+            )
+            mf = ModelFeatures(name=ext.model_name, segments=segs, songs=song_level)
+
+            if ext.model_name in self._model_features:
+                old = self._model_features[ext.model_name]
+                merged_segments = SegmentLevel(
+                    embeddings=np.vstack([old.segments.embeddings, segs.embeddings]),
+                    song_id=np.concatenate([old.segments.song_id, segs.song_id]),
+                    start_s=np.concatenate([old.segments.start_s, segs.start_s]),
+                    end_s=np.concatenate([old.segments.end_s, segs.end_s]),
+                )
+                merged_songs = SongLevel(
+                    centroid=np.vstack([old.songs.centroid, song_level.centroid]),
+                    stats2D=np.vstack([old.songs.stats2D, song_level.stats2D]),
+                    song_id=np.concatenate([old.songs.song_id, song_level.song_id]),
+                    path=list(old.songs.path) + list(song_level.path),
+                )
+                self._model_features[ext.model_name] = ModelFeatures(
+                    name=ext.model_name, segments=merged_segments, songs=merged_songs
+                )
             else:
-                self.features[ext.model_name] = new_vecs
+                self._model_features[ext.model_name] = mf
+                self._model_names.append(ext.model_name)
+
+        features = self._model_features[self._model_names[0]].songs.stats2D
+        oc_feats = (
+            self._model_features[self._model_names[1]].songs.stats2D
+            if len(self._model_names) > 1
+            else None
+        )
+        plc_feats = (
+            self._model_features[self._model_names[2]].songs.stats2D
+            if len(self._model_names) > 2
+            else None
+        )
+
+        n_edges = len(self.model.cat_list)
+        app = QApplication.instance()
+        if app:
+            app.setOverrideCursor(Qt.WaitCursor)
+        try:
+            matrix, _ = temi_cluster(
+                features, out_dim=n_edges, threshold=THRESHOLD_DEFAULT
+            )
+            oc_matrix = None
+            if oc_feats is not None:
+                oc_matrix, _ = temi_cluster(
+                    oc_feats, out_dim=n_edges, threshold=THRESHOLD_DEFAULT
+                )
+            plc_matrix = None
+            if plc_feats is not None:
+                plc_matrix, _ = temi_cluster(
+                    plc_feats, out_dim=n_edges, threshold=THRESHOLD_DEFAULT
+                )
+
+            empty_cols = np.where(matrix.sum(axis=0) == 0)[0]
+            if len(empty_cols) > 0:
+                matrix = np.delete(matrix, empty_cols, axis=1)
+            if oc_matrix is not None:
+                oc_empty = np.where(oc_matrix.sum(axis=0) == 0)[0]
+                if len(oc_empty) > 0:
+                    oc_matrix = np.delete(oc_matrix, oc_empty, axis=1)
+            if plc_matrix is not None:
+                plc_empty = np.where(plc_matrix.sum(axis=0) == 0)[0]
+                if len(plc_empty) > 0:
+                    plc_matrix = np.delete(plc_matrix, plc_empty, axis=1)
+        except Exception as e:
+            if app:
+                app.restoreOverrideCursor()
+            QMessageBox.critical(self, "Processing Error", str(e))
+            return
+        if app:
+            app.restoreOverrideCursor()
+
+        df = pd.DataFrame(
+            matrix.astype(int),
+            columns=[f"edge_{i}" for i in range(matrix.shape[1])],
+        )
+
+        new_files = self.model.im_list + files
+        metadata = self.model.metadata
+        if metadata is not None:
+            metadata = pd.concat(
+                [metadata, pd.DataFrame(index=np.arange(len(files)))],
+                ignore_index=True,
+            )
+
+        try:
+            self.model.layoutChanged.disconnect(self.regroup)
+        except Exception:
+            pass
+        try:
+            self.model.layoutChanged.disconnect(self._on_layout_changed)
+        except Exception:
+            pass
+        try:
+            self.model.hyperedgeModified.disconnect(
+                self._on_model_hyperedge_modified
+            )
+        except Exception:
+            pass
+
+        self.model = SessionModel(
+            new_files,
+            df,
+            features,
+            self.model.h5_path,
+            openclip_features=oc_feats,
+            places365_features=plc_feats,
+            thumbnail_data=self.model.thumbnail_data,
+            thumbnails_are_embedded=self.model.thumbnails_are_embedded,
+            metadata=metadata,
+        )
+
+        if oc_feats is not None and oc_feats.size and oc_matrix is not None:
+            origin = self._model_names[1].lower()
+            self.model.append_clustering_matrix(oc_matrix, origin=origin, prefix=origin)
+        if plc_feats is not None and plc_feats.size and plc_matrix is not None:
+            origin = self._model_names[2].lower()
+            self.model.append_clustering_matrix(plc_matrix, origin=origin, prefix=origin)
+        self.model.prune_similar_edges(JACCARD_PRUNE_DEFAULT)
+
+        self.model.layoutChanged.connect(self.regroup)
+        self._overview_triplets = None
+        self.model.layoutChanged.connect(self._on_layout_changed)
+        self.model.hyperedgeModified.connect(
+            self._on_model_hyperedge_modified
+        )
+
+        self.audio_table.clear()
+        for name in self._model_names:
+            self.audio_table.add_model(name, self.model)
+        self.audio_table.set_use_full_images(True)
+        self.thumb_toggle_act.setChecked(True)
+        self.matrix_dock.set_model(self.model)
+        self.spatial_dock.set_model(self.model)
+        self.regroup()
+
         self.audio_files.extend(files)
+
 
 
     def on_add_hyperedge(self):
@@ -1079,6 +1255,8 @@ class MainWin(QMainWindow):
             Path(directory),
             openclip_features=oc_features,
             places365_features=plc_features,
+            model_features=model_feats,
+            model_names=models,
         )
         if oc_matrix.size:
             origin = models[1].lower()
@@ -1127,12 +1305,13 @@ class MainWin(QMainWindow):
                     pass
 
             self.model = SessionModel.load_h5(path)
-            self._model_names = ["CLAP", "MERT", "OpenL3"]
+            self._model_features = getattr(self.model, "model_features", {})
+            self._model_names = getattr(self.model, "model_names", list(self._model_features.keys()))
 
             self.model.layoutChanged.connect(self.regroup)
             self._overview_triplets = None
             self.model.layoutChanged.connect(self._on_layout_changed)
-            self.model.hyperedgeModified.connect(self._on_model_hyperedge_modified)            
+            self.model.hyperedgeModified.connect(self._on_model_hyperedge_modified)
         except Exception as e:
             QMessageBox.critical(self, "Load error", str(e))
             return
@@ -1144,7 +1323,10 @@ class MainWin(QMainWindow):
         else:
             self.image_grid.set_use_full_images(True)
             self.thumb_toggle_act.setChecked(True)
-        self.overlap_dock.set_model(self.model)            
+        self.audio_table.clear()
+        for name in self._model_names:
+            self.audio_table.add_model(name, self.model)
+        self.overlap_dock.set_model(self.model)
         self.matrix_dock.set_model(self.model)
         self.spatial_dock.set_model(self.model)
         self.regroup()
