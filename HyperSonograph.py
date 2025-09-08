@@ -1316,17 +1316,12 @@ class MainWin(QMainWindow):
             QMessageBox.critical(self, "Load error", str(e))
             return
 
-        self.image_grid.set_model(self.model)
-        if self.model.thumbnail_data:
-            self.image_grid.set_use_full_images(False)
-            self.thumb_toggle_act.setChecked(False)
-        else:
-            self.image_grid.set_use_full_images(True)
-            self.thumb_toggle_act.setChecked(True)
         self.audio_table.clear()
         for name in self._model_names:
             self.audio_table.add_model(name, self.model)
-        self.overlap_dock.set_model(self.model)
+        self.audio_table.set_use_full_images(True)
+        self.thumb_toggle_act.setChecked(True)
+
         self.matrix_dock.set_model(self.model)
         self.spatial_dock.set_model(self.model)
         self.regroup()
