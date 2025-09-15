@@ -6,6 +6,7 @@ from utils.similarity import SIM_METRIC
 from pathlib import Path
 import io
 import torch
+import logging
 import time
 import pyqtgraph as pg
 from PyQt5.QtWidgets import (
@@ -793,7 +794,7 @@ class MainWin(QMainWindow):
         appended to ``_model_features`` and the hypergraph is reconstructed so
         that the UI reflects the newly added songs.
         """
-
+        print(len(files))
         if not self.model:
             QMessageBox.warning(
                 self, "No Session", "Please load or create a session first."
@@ -821,7 +822,6 @@ class MainWin(QMainWindow):
 
         start_idx = len(self.model.im_list)
         file_index = {f: start_idx + i for i, f in enumerate(files)}
-        existing_models = set(self._model_names)
 
         for ext in extractors:
             Xseg, rows, songs = ext.extract_segments_and_songs(files)
@@ -856,6 +856,9 @@ class MainWin(QMainWindow):
                 path=paths,
             )
             mf = ModelFeatures(name=ext.model_name, segments=segs, songs=song_level)
+            missing_files = [
+                f for i, f in enumerate(files) if (start_idx + i) not in song_ids
+            ]
 
             if ext.model_name in self._model_features:
                 old = self._model_features[ext.model_name]
@@ -865,11 +868,25 @@ class MainWin(QMainWindow):
                     start_s=np.concatenate([old.segments.start_s, segs.start_s]),
                     end_s=np.concatenate([old.segments.end_s, segs.end_s]),
                 )
+                n_total = start_idx + len(files)
+                padded_centroid = np.zeros(
+                    (n_total, old.songs.centroid.shape[1]), dtype=old.songs.centroid.dtype
+                )
+                padded_stats = np.zeros(
+                    (n_total, old.songs.stats2D.shape[1]), dtype=old.songs.stats2D.dtype
+                )
+                padded_centroid[:start_idx] = old.songs.centroid
+                padded_stats[:start_idx] = old.songs.stats2D
+                if song_ids.size:
+                    padded_centroid[song_ids] = centroids
+                    padded_stats[song_ids] = stats
+                padded_song_ids = np.arange(n_total, dtype=np.int32)
+                padded_paths = self.model.im_list + files
                 merged_songs = SongLevel(
-                    centroid=np.vstack([old.songs.centroid, song_level.centroid]),
-                    stats2D=np.vstack([old.songs.stats2D, song_level.stats2D]),
-                    song_id=np.concatenate([old.songs.song_id, song_level.song_id]),
-                    path=list(old.songs.path) + list(song_level.path),
+                    centroid=padded_centroid,
+                    stats2D=padded_stats,
+                    song_id=padded_song_ids,
+                    path=padded_paths,
                 )
                 self._model_features[ext.model_name] = ModelFeatures(
                     name=ext.model_name, segments=merged_segments, songs=merged_songs
@@ -894,6 +911,15 @@ class MainWin(QMainWindow):
                 )
                 self._model_names.append(ext.model_name)
 
+            if missing_files:
+                logging.warning(
+                    "No features extracted for %d file(s): %s",
+                    len(missing_files),
+                    missing_files,
+                )
+
+
+
         features = self._model_features[self._model_names[0]].songs.stats2D
         oc_feats = (
             self._model_features[self._model_names[1]].songs.stats2D
@@ -906,9 +932,6 @@ class MainWin(QMainWindow):
             else None
         )
 
-        total_songs = start_idx + len(files)
-        oc_model_new = len(self._model_names) > 1 and self._model_names[1] not in existing_models
-        plc_model_new = len(self._model_names) > 2 and self._model_names[2] not in existing_models
 
         n_edges = len(self.model.cat_list)
         app = QApplication.instance()
@@ -920,28 +943,14 @@ class MainWin(QMainWindow):
             )
             oc_matrix = None
             if oc_feats is not None:
-                if oc_model_new:
-                    oc_part, _ = temi_cluster(
-                        oc_feats[start_idx:], out_dim=n_edges, threshold=THRESHOLD_DEFAULT
-                    )
-                    oc_matrix = np.zeros((total_songs, oc_part.shape[1]), dtype=oc_part.dtype)
-                    oc_matrix[start_idx:, :] = oc_part
-                else:
-                    oc_matrix, _ = temi_cluster(
-                        oc_feats, out_dim=n_edges, threshold=THRESHOLD_DEFAULT
-                    )
+                oc_matrix, _ = temi_cluster(
+                    oc_feats, out_dim=n_edges, threshold=THRESHOLD_DEFAULT
+                )
             plc_matrix = None
             if plc_feats is not None:
-                if plc_model_new:
-                    plc_part, _ = temi_cluster(
-                        plc_feats[start_idx:], out_dim=n_edges, threshold=THRESHOLD_DEFAULT
-                    )
-                    plc_matrix = np.zeros((total_songs, plc_part.shape[1]), dtype=plc_part.dtype)
-                    plc_matrix[start_idx:, :] = plc_part
-                else:
-                    plc_matrix, _ = temi_cluster(
-                        plc_feats, out_dim=n_edges, threshold=THRESHOLD_DEFAULT
-                    )
+                plc_matrix, _ = temi_cluster(
+                    plc_feats, out_dim=n_edges, threshold=THRESHOLD_DEFAULT
+                )
 
 
             empty_cols = np.where(matrix.sum(axis=0) == 0)[0]
@@ -1001,7 +1010,10 @@ class MainWin(QMainWindow):
             thumbnail_data=self.model.thumbnail_data,
             thumbnails_are_embedded=self.model.thumbnails_are_embedded,
             metadata=metadata,
+            model_features=self._model_features,
+            model_names=self._model_names,
         )
+        print('second',len(files))
 
         if oc_feats is not None and oc_feats.size and oc_matrix is not None:
             origin = self._model_names[1].lower()
