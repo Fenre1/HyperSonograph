@@ -75,7 +75,8 @@ class TeacherStudentCombo(nn.Module):
         # there is no backpropagation through the teacher, so no need for gradients
         for p in teacher.parameters():
             p.requires_grad = False
-        print(f"Student and Teacher are built: they are both {args.arch} network.")
+        if getattr(args, "verbose", False):
+            print(f"Student and Teacher are built: they are both {args.arch} network.")
         self.args = args
         self.student = student
         self.teacher = teacher
@@ -115,14 +116,16 @@ def load_model(config, head=True, split_preprocess=False):
     if not config.precomputed:
         raise ValueError("This version of load_model only supports precomputed=True")
     backbone = config.arch  # Typically 'custom' or a placeholder
-    print("Using precomputed embeddings from", config.arch)
+    if getattr(config, "verbose", False):
+        print("Using precomputed embeddings from", config.arch)
     if head:
         if getattr(config, "embed_dim", None) is None:
             raise ValueError("embed_dim must be set for head construction")
         mmc_params = inspect.signature(MultiHeadClassifier).parameters
         mmc_args = {k: v for k, v in config.__dict__.items() if k in mmc_params}
         model = MultiHeadClassifier(backbone, **mmc_args)
-        print("Head loaded.")
+        if getattr(config, "verbose", False):
+            print("Head loaded.")
     else:
         model = backbone
     if split_preprocess:
@@ -187,11 +190,12 @@ def get_args(out_dim, embed_dim):
         # misc
         loader='EmbedNN',
         loader_args={},
+        verbose=False,
     )
 
 
 @torch.no_grad()
-def compute_neighbors(embedding, k):
+def compute_neighbors(embedding, k, verbose=False):
     embedding = embedding / embedding.norm(p=2, dim=-1, keepdim=True)
     num_embeds = embedding.shape[0]
     if num_embeds <= 8 * 1e4:
@@ -201,7 +205,8 @@ def compute_neighbors(embedding, k):
     else:
         topk_knn_ids = []
         topk_knn_dists = []
-        print("Chunk-wise implementation of k-nn in GPU")
+        if verbose:
+            print("Chunk-wise implementation of k-nn in GPU")
         step_size = 64
         embedding = embedding.cuda()
         for idx in range(0, num_embeds, step_size):
@@ -218,7 +223,7 @@ def compute_neighbors(embedding, k):
 def train_one_epoch(student_teacher_model, dino_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
                     fp16_scaler, args):
-    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger = utils.MetricLogger(delimiter="  ", enabled=getattr(args, "verbose", False))
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
     for it, data in enumerate(metric_logger.log_every(data_loader, 10, header)):
         images, _ = data
@@ -290,7 +295,8 @@ def train_one_epoch(student_teacher_model, dino_loss, data_loader,
         else:
             avg_loss = metric_logger.meters['head_losses'].global_avg
         d_loss = dino_loss[0] if hasattr(dino_loss, "__getitem__") else dino_loss
-    print("Averaged stats:", metric_logger)
+    if getattr(args, "verbose", False):
+        print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.scalar_meters.items()}
 
 
@@ -298,11 +304,15 @@ def train_dino(args, features, knn, progress_callback=None):
     
     fix_random_seeds(args.seed)
     cudnn.benchmark = True
-    print('pre loading')
+    verbose = getattr(args, "verbose", False)
+    if verbose:
+        print('pre loading')
     student, _, normalize = load_model(args, head=True, split_preprocess=True)
-    print('loading1')
+    if verbose:
+        print('loading1')
     teacher, _ = load_model(args)
-    print('loading2')
+    if verbose:
+        print('loading2')
     if not args.precomputed:
         aug = IMAGE_AUGMENTATIONS[args.image_aug](num_augs=args.num_augs, **args.aug_args)
         transform = AugWrapper(
@@ -316,14 +326,12 @@ def train_dino(args, features, knn, progress_callback=None):
         aug = EMBED_AUGMENTATIONS[args.embed_aug](num_augs=args.num_augs, **args.aug_args)
         transform = AugWrapper(global_augs=aug)
     dataset = EmbedNN(features, None, knn, transform=transform, k=args.knn)
-    print('fire1')
     sampler = None
     # if len(dataset) < 10*args.batch_size_per_gpu: 
     #     check_drop = False
     # else:
     #     check_drop = True
     check_drop = len(dataset) % args.batch_size_per_gpu != 0
-    print('fire2')
     data_loader = torch.utils.data.DataLoader(
         dataset,
         shuffle=(sampler is None),
@@ -333,9 +341,9 @@ def train_dino(args, features, knn, progress_callback=None):
         pin_memory=True,
         drop_last=check_drop,
     )
-    print('fire3')
-    print(f"In-distribution Data loaded: there are {len(dataset)} images.")
-    print("len dataloader", len(data_loader))
+    if verbose:
+        print(f"In-distribution Data loaded: there are {len(dataset)} images.")
+        print("len dataloader", len(data_loader))
     student_teacher_model = TeacherStudentCombo(teacher=teacher, student=student, args=args)
     student_teacher_model = student_teacher_model.cuda()
     loss_class = getattr(losses, args.loss)
@@ -381,10 +389,12 @@ def train_dino(args, features, knn, progress_callback=None):
     )
     momentum_schedule = utils.cosine_scheduler(args.momentum_teacher, args.max_momentum_teacher,
                                                args.epochs, len(data_loader))
-    print("Loss, optimizer and schedulers ready.")
+    if verbose:
+        print("Loss, optimizer and schedulers ready.")
     start_epoch = 0
     start_time = time.time()
-    print("Starting DINO training!")
+    if verbose:
+        print("Starting DINO training!")
     for epoch in range(args.epochs):
         train_stats = train_one_epoch(
             student_teacher_model, dino_loss, data_loader,
@@ -395,7 +405,8 @@ def train_dino(args, features, knn, progress_callback=None):
             progress_callback(epoch + 1, args.epochs)
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    if verbose:
+        print('Training time {}'.format(total_time_str))
     return student_teacher_model.module.student
 
 @torch.no_grad()
@@ -425,11 +436,11 @@ def run_eval_pipeline(model, features, threshold, use_head=True):
 
     return generate_hypergraph(all_indices, threshold)
 
-def make_knn(features,num_k=25):
-    nn_dists, knn = compute_neighbors(features, num_k)
+def make_knn(features,num_k=25, verbose=False):
+    nn_dists, knn = compute_neighbors(features, num_k, verbose=verbose)
     return nn_dists, knn
 
-def train_model(features: Union[np.ndarray, torch.Tensor], out_dim: int, progress_callback=None) -> nn.Module:
+def train_model(features: Union[np.ndarray, torch.Tensor], out_dim: int, progress_callback=None, verbose=False) -> nn.Module:
     """
     Train the clustering model on the input features.
 
@@ -442,11 +453,11 @@ def train_model(features: Union[np.ndarray, torch.Tensor], out_dim: int, progres
     """
     features = torch.tensor(features, dtype=torch.float32) if not torch.is_tensor(features) else features
     args = get_args(out_dim, features.shape[1])
-
+    args.verbose = verbose
     if args.batch_size_per_gpu > len(features):
         args.batch_size_per_gpu = len(features)//2
 
-    _, knn = compute_neighbors(features, args.knn)
+    _, knn = compute_neighbors(features, args.knn, verbose=args.verbose)
     return train_dino(args, features, knn, progress_callback)
 
 @torch.no_grad()
@@ -493,7 +504,9 @@ def temi_cluster(
     features: Union[np.ndarray, torch.Tensor],
     out_dim: int,
     threshold: float,
+    *,
     progress_callback=None,
+    verbose=False,
 ) -> Tuple[np.ndarray, nn.Module]:
     """
     Convenience wrapper to train model and generate hypergraph in one call.
@@ -502,13 +515,13 @@ def temi_cluster(
         - hypergraph (np.ndarray): Clustering result
         - model (nn.Module): Trained model
     """
-    model = train_model(features, out_dim, progress_callback)
+    model = train_model(features, out_dim, progress_callback, verbose=verbose)
     hypergraph = generate_hypergraph(model, features, threshold)
     return hypergraph, model
 
 if __name__ == "__main__":
     dummy = np.random.randn(500, 1536).astype(np.float32)
-    hypergraph, model = temi_cluster(dummy, out_dim=10, threshold=0.5)
+    hypergraph, model = temi_cluster(dummy, out_dim=10, threshold=0.5, verbose=True)
     print("Hypergraph shape:", hypergraph.shape)
 
 

@@ -299,9 +299,10 @@ def reduce_dict(input_dict, average=True):
 
 
 class MetricLogger(object):
-    def __init__(self, delimiter="\t"):
+    def __init__(self, delimiter="\t", enabled=True):
         self.meters = defaultdict(SmoothedValue)
         self.delimiter = delimiter
+        self.enabled = enabled
 
     @property
     def scalar_meters(self):
@@ -374,7 +375,7 @@ class MetricLogger(object):
             data_time.update(time.time() - end)
             yield obj
             iter_time.update(time.time() - end)
-            if i % print_freq == 0 or i == len(iterable) - 1:
+            if self.enabled and (i % print_freq == 0 or i == len(iterable) - 1):
                 eta_seconds = iter_time.global_avg * (len(iterable) - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
                 if torch.cuda.is_available():
@@ -392,8 +393,9 @@ class MetricLogger(object):
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print('{} Total time: {} ({:.6f} s / it)'.format(
-            header, total_time_str, total_time / len(iterable)))
+        if self.enabled:
+            print('{} Total time: {} ({:.6f} s / it)'.format(
+                header, total_time_str, total_time / len(iterable)))
 
 
 def get_sha():
