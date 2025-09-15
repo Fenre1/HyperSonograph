@@ -4,16 +4,52 @@ import matplotlib.pyplot as plt
 from sklearn.metrics.pairwise import cosine_similarity as _cos
 
 #%%
-file_name = r"F:\Stuff\HyperSonographSessions\s3.h5"
+file_name = r"F:\Stuff\HyperSonographSessions\s2.h5"
 data = []
 with h5py.File(file_name, "r") as f:
     data.append(f['features'][()])
+
+    # data.append(f['audio_model_features'][''])
     for dataset_name in f.keys():
         print(dataset_name)
         
-        
+#%%
+import h5py
+
+file_name = r"F:\Stuff\HyperSonographSessions\s2.h5"
+
+with h5py.File(file_name, "r") as f:
+    amf = f["audio_model_features"]
+    for model_name, g in amf.items():
+        # pak de dataset
+        paths = g["song_path"][()]       # of [:]
+        # indien als bytes opgeslagen: decodeer
+        if getattr(paths, "dtype", None) is not None and (paths.dtype.kind == "S" or paths.dtype == object):
+            paths = [p.decode("utf-8") if isinstance(p, (bytes, bytearray)) else str(p) for p in paths]
+        print(model_name, len(paths), "paths")
+
         # %%
-features = data[0]
+#%%
+            if getattr(self, "model_features", None):
+                grp = hdf.create_group("audio_model_features")
+                for name, mf in self.model_features.items():
+                    g = grp.create_group(name)
+                    segs = mf.segments
+                    g.create_dataset("segment_embeddings", data=segs.embeddings, dtype="f4")
+                    g.create_dataset("segment_song_id", data=segs.song_id, dtype="i4")
+                    g.create_dataset("segment_start_s", data=segs.start_s, dtype="f4")
+                    g.create_dataset("segment_end_s", data=segs.end_s, dtype="f4")
+                    songs = mf.songs
+                    g.create_dataset("song_centroid", data=songs.centroid, dtype="f4")
+                    g.create_dataset("song_stats2D", data=songs.stats2D, dtype="f4")
+                    g.create_dataset("song_song_id", data=songs.song_id, dtype="i4")
+                    g.create_dataset(
+                        "song_path", data=np.array(list(songs.path), dtype=object), dtype=dt
+                    )
+
+
+#%%
+features = data[1]
 # %%
 plt.plot(features)
 # %%

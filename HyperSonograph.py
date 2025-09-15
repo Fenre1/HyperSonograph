@@ -804,14 +804,17 @@ class MainWin(QMainWindow):
         extractors: list[AudioFeatureExtractorBase] = []
         try:
             extractors.append(CLAPFeatureExtractor())
+            'success clap'
         except Exception:
             pass
         try:
             extractors.append(MERTFeatureExtractor())
+            'success mert'
         except Exception:
             pass
         try:
             extractors.append(OpenL3FeatureExtractor())
+            'success openl3'
         except Exception:
             pass
         if not extractors:
@@ -822,7 +825,7 @@ class MainWin(QMainWindow):
 
         start_idx = len(self.model.im_list)
         file_index = {f: start_idx + i for i, f in enumerate(files)}
-
+        print('stsd',start_idx)
         for ext in extractors:
             Xseg, rows, songs = ext.extract_segments_and_songs(files)
 
@@ -875,8 +878,8 @@ class MainWin(QMainWindow):
                 padded_stats = np.zeros(
                     (n_total, old.songs.stats2D.shape[1]), dtype=old.songs.stats2D.dtype
                 )
-                padded_centroid[:start_idx] = old.songs.centroid
-                padded_stats[:start_idx] = old.songs.stats2D
+                padded_centroid[old.songs.song_id] = old.songs.centroid
+                padded_stats[old.songs.song_id] = old.songs.stats2D
                 if song_ids.size:
                     padded_centroid[song_ids] = centroids
                     padded_stats[song_ids] = stats
@@ -921,6 +924,7 @@ class MainWin(QMainWindow):
 
 
         features = self._model_features[self._model_names[0]].songs.stats2D
+        print('len features',len(features))
         oc_feats = (
             self._model_features[self._model_names[1]].songs.stats2D
             if len(self._model_names) > 1
@@ -941,29 +945,10 @@ class MainWin(QMainWindow):
             matrix, _ = temi_cluster(
                 features, out_dim=n_edges, threshold=THRESHOLD_DEFAULT
             )
-            oc_matrix = None
-            if oc_feats is not None:
-                oc_matrix, _ = temi_cluster(
-                    oc_feats, out_dim=n_edges, threshold=THRESHOLD_DEFAULT
-                )
-            plc_matrix = None
-            if plc_feats is not None:
-                plc_matrix, _ = temi_cluster(
-                    plc_feats, out_dim=n_edges, threshold=THRESHOLD_DEFAULT
-                )
-
 
             empty_cols = np.where(matrix.sum(axis=0) == 0)[0]
             if len(empty_cols) > 0:
                 matrix = np.delete(matrix, empty_cols, axis=1)
-            if oc_matrix is not None:
-                oc_empty = np.where(oc_matrix.sum(axis=0) == 0)[0]
-                if len(oc_empty) > 0:
-                    oc_matrix = np.delete(oc_matrix, oc_empty, axis=1)
-            if plc_matrix is not None:
-                plc_empty = np.where(plc_matrix.sum(axis=0) == 0)[0]
-                if len(plc_empty) > 0:
-                    plc_matrix = np.delete(plc_matrix, plc_empty, axis=1)
         except Exception as e:
             if app:
                 app.restoreOverrideCursor()
@@ -976,8 +961,11 @@ class MainWin(QMainWindow):
             matrix.astype(int),
             columns=[f"edge_{i}" for i in range(matrix.shape[1])],
         )
+        print('len features',len(features))
 
         new_files = self.model.im_list + files
+        print('new_files',len(new_files))
+        print(new_files)
         metadata = self.model.metadata
         if metadata is not None:
             metadata = pd.concat(
@@ -985,22 +973,9 @@ class MainWin(QMainWindow):
                 ignore_index=True,
             )
 
-        try:
-            self.model.layoutChanged.disconnect(self.regroup)
-        except Exception:
-            pass
-        try:
-            self.model.layoutChanged.disconnect(self._on_layout_changed)
-        except Exception:
-            pass
-        try:
-            self.model.hyperedgeModified.disconnect(
-                self._on_model_hyperedge_modified
-            )
-        except Exception:
-            pass
+        self._disconnect_model_signals()
 
-        self.model = SessionModel(
+        base_model = SessionModel(
             new_files,
             df,
             features,
@@ -1013,31 +988,15 @@ class MainWin(QMainWindow):
             model_features=self._model_features,
             model_names=self._model_names,
         )
-        print('second',len(files))
-
-        if oc_feats is not None and oc_feats.size and oc_matrix is not None:
-            origin = self._model_names[1].lower()
-            self.model.append_clustering_matrix(oc_matrix, origin=origin, prefix=origin)
-        if plc_feats is not None and plc_feats.size and plc_matrix is not None:
-            origin = self._model_names[2].lower()
-            self.model.append_clustering_matrix(plc_matrix, origin=origin, prefix=origin)
-        self.model.prune_similar_edges(JACCARD_PRUNE_DEFAULT)
-
-        self.model.layoutChanged.connect(self.regroup)
-        self._overview_triplets = None
-        self.model.layoutChanged.connect(self._on_layout_changed)
-        self.model.hyperedgeModified.connect(
-            self._on_model_hyperedge_modified
+        self.model = base_model
+        success = self.reconstruct_hypergraph(
+            n_edges,
+            THRESHOLD_DEFAULT,
+            JACCARD_PRUNE_DEFAULT,
+            show_dialog=False,
         )
-
-        self.audio_table.clear()
-        for name in self._model_names:
-            self.audio_table.add_model(name, self.model)
-        self.audio_table.set_use_full_images(True)
-        self.thumb_toggle_act.setChecked(True)
-        self.matrix_dock.set_model(self.model)
-        self.spatial_dock.set_model(self.model)
-        self.regroup()
+        if not success:
+            self._set_new_model(base_model, JACCARD_PRUNE_DEFAULT)
 
         self.audio_files.extend(files)
 
@@ -1274,29 +1233,16 @@ class MainWin(QMainWindow):
 
         matrix = matrices[models[0]]
         features = features_by_model[models[0]]
-        oc_matrix = matrices.get(models[1]) if len(models) > 1 else np.array([])
         oc_features = features_by_model.get(models[1]) if len(models) > 1 else None
-        plc_matrix = matrices.get(models[2]) if len(models) > 2 else np.array([])
         plc_features = features_by_model.get(models[2]) if len(models) > 2 else None
         self._model_features = model_feats
         self._model_names = models
         df = pd.DataFrame(matrix.astype(int), columns=[f"edge_{i}" for i in range(matrix.shape[1])])
 
         if self.model:
-            try:
-                self.model.layoutChanged.disconnect(self.regroup)
-            except TypeError:
-                pass
-            try:
-                self.model.layoutChanged.disconnect(self._on_layout_changed)
-            except TypeError:
-                pass
-            try:
-                self.model.hyperedgeModified.disconnect(self._on_model_hyperedge_modified)
-            except TypeError:
-                pass
+            self._disconnect_model_signals()
 
-        self.model = SessionModel(
+        base_model = SessionModel(
             files,
             df,
             features,
@@ -1306,28 +1252,15 @@ class MainWin(QMainWindow):
             model_features=model_feats,
             model_names=models,
         )
-        if oc_matrix.size:
-            origin = models[1].lower()
-            self.model.append_clustering_matrix(oc_matrix, origin=origin, prefix=origin)
-        if plc_matrix.size:
-            origin = models[2].lower()
-            self.model.append_clustering_matrix(plc_matrix, origin=origin, prefix=origin)
-        self.model.prune_similar_edges(prune_thr)
-
-
-        self.model.layoutChanged.connect(self.regroup)
-        self._overview_triplets = None
-        self.model.layoutChanged.connect(self._on_layout_changed)
-        self.model.hyperedgeModified.connect(self._on_model_hyperedge_modified)
-
-        self.audio_table.clear()
-        for name in self._model_names:
-            self.audio_table.add_model(name, self.model)
-        self.audio_table.set_use_full_images(True)
-        self.thumb_toggle_act.setChecked(True)
-        self.matrix_dock.set_model(self.model)
-        self.spatial_dock.set_model(self.model)
-        self.regroup()
+        self.model = base_model
+        success = self.reconstruct_hypergraph(
+            n_edges,
+            thr,
+            prune_thr,
+            show_dialog=False,
+        )
+        if not success:
+            self._set_new_model(base_model, prune_thr)
 
 
     def open_session(self):
@@ -1339,18 +1272,7 @@ class MainWin(QMainWindow):
         try:
             # If a model already exists, disconnect its signal first
             if self.model:
-                try:
-                    self.model.layoutChanged.disconnect(self.regroup)
-                except TypeError:
-                    pass
-                try:
-                    self.model.layoutChanged.disconnect(self._on_layout_changed)
-                except TypeError:
-                    pass
-                try:
-                    self.model.hyperedgeModified.disconnect(self._on_model_hyperedge_modified)
-                except TypeError:
-                    pass
+                self._disconnect_model_signals()
 
             self.model = SessionModel.load_h5(path)
             self._model_features = getattr(self.model, "model_features", {})
@@ -1405,28 +1327,88 @@ class MainWin(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Save Error", str(e))
 
-    def reconstruct_hypergraph(self):
+    def _disconnect_model_signals(self) -> None:
+        if not self.model:
+            return
+        for signal, slot in (
+            (self.model.layoutChanged, self.regroup),
+            (self.model.layoutChanged, self._on_layout_changed),
+            (self.model.hyperedgeModified, self._on_model_hyperedge_modified),
+        ):
+            try:
+                signal.disconnect(slot)
+            except Exception:
+                pass
+
+    def _set_new_model(self, model: SessionModel, prune_thr: float | None) -> None:
+        self.model = model
+        if prune_thr is not None:
+            self.model.prune_similar_edges(prune_thr)
+
+        self.model.layoutChanged.connect(self.regroup)
+        self._overview_triplets = None
+        self.model.layoutChanged.connect(self._on_layout_changed)
+        self.model.hyperedgeModified.connect(self._on_model_hyperedge_modified)
+
+        self.audio_table.clear()
+        for name in self._model_names:
+            self.audio_table.add_model(name, self.model)
+        self.audio_table.set_use_full_images(True)
+        self.thumb_toggle_act.setChecked(True)
+
+        self.matrix_dock.set_model(self.model)
+        self.spatial_dock.set_model(self.model)
+        self.regroup()
+
+    def reconstruct_hypergraph(
+        self,
+        n_edges: int | None = None,
+        thr: float | None = None,
+        prune_thr: float | None = None,
+        *,
+        show_dialog: bool = True,
+    ) -> bool:
         """Re-run clustering using existing features."""
         if not self.model:
             QMessageBox.warning(self, "No Session", "Please load a session first.")
-            return
+            return False
 
-        dlg = ReconstructDialog(len(self.model.cat_list), self)
-        if dlg.exec_() != QDialog.Accepted:
-            return
+        if show_dialog:
+            dlg = ReconstructDialog(len(self.model.cat_list), self)
+            if dlg.exec_() != QDialog.Accepted:
+                return False
+            try:
+                n_edges, thr, prune_thr = dlg.parameters()
+            except Exception:
+                QMessageBox.warning(self, "Invalid Input", "Enter valid numbers.")
+                return False
+        else:
+            if n_edges is None:
+                n_edges = len(self.model.cat_list)
+            if thr is None:
+                thr = THRESHOLD_DEFAULT
+            if prune_thr is None:
+                prune_thr = JACCARD_PRUNE_DEFAULT
+
         try:
-            n_edges, thr, prune_thr = dlg.parameters()
-        except Exception:
+            n_edges = int(n_edges)  # type: ignore[arg-type]
+            thr = float(thr)  # type: ignore[arg-type]
+            prune_thr = float(prune_thr)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
             QMessageBox.warning(self, "Invalid Input", "Enter valid numbers.")
-            return
+            return False
 
         app = QApplication.instance()
         if app:
             app.setOverrideCursor(Qt.WaitCursor)
         try:
             features = self.model.features
-            oc_feats = self.model.openclip_features if len(self._model_names) > 1 else None
-            plc_feats = self.model.places365_features if len(self._model_names) > 2 else None
+            oc_feats = (
+                self.model.openclip_features if len(self._model_names) > 1 else None
+            )
+            plc_feats = (
+                self.model.places365_features if len(self._model_names) > 2 else None
+            )
 
             matrix, _ = temi_cluster(features, out_dim=n_edges, threshold=thr)
             oc_matrix = None
@@ -1442,7 +1424,7 @@ class MainWin(QMainWindow):
                 QMessageBox.information(
                     self,
                     "Empty Hyperedges Removed",
-                    f"{len(empty_cols)} empty hyperedges were removed after clustering."
+                    f"{len(empty_cols)} empty hyperedges were removed after clustering.",
                 )
             if oc_matrix is not None:
                 oc_empty = np.where(oc_matrix.sum(axis=0) == 0)[0]
@@ -1456,26 +1438,47 @@ class MainWin(QMainWindow):
             if app:
                 app.restoreOverrideCursor()
             QMessageBox.critical(self, "Reconstruction Error", str(e))
-            return
+            return False
         if app:
             app.restoreOverrideCursor()
 
-        df = pd.DataFrame(matrix.astype(int), columns=[f"edge_{i}" for i in range(matrix.shape[1])])
+        df_parts: list[pd.DataFrame] = []
+        edge_origins: list[str] = []
 
-        try:
-            self.model.layoutChanged.disconnect(self.regroup)
-        except Exception:
-            pass
-        try:
-            self.model.layoutChanged.disconnect(self._on_layout_changed)
-        except Exception:
-            pass
-        try:
-            self.model.hyperedgeModified.disconnect(self._on_model_hyperedge_modified)
-        except Exception:
-            pass
+        base_cols = [f"edge_{i}" for i in range(matrix.shape[1])]
+        df_parts.append(pd.DataFrame(matrix.astype(int), columns=base_cols))
+        edge_origins.extend(["swinv2"] * len(base_cols))
+        start_idx = len(base_cols)
 
-        self.model = SessionModel(
+        if oc_matrix is not None and oc_matrix.size:
+            oc_origin = (
+                self._model_names[1].lower()
+                if len(self._model_names) > 1
+                else "openclip"
+            )
+            oc_cols = [f"{oc_origin}_{start_idx + i}" for i in range(oc_matrix.shape[1])]
+            df_parts.append(pd.DataFrame(oc_matrix.astype(int), columns=oc_cols))
+            edge_origins.extend([oc_origin] * oc_matrix.shape[1])
+            start_idx += oc_matrix.shape[1]
+
+        if plc_matrix is not None and plc_matrix.size:
+            plc_origin = (
+                self._model_names[2].lower()
+                if len(self._model_names) > 2
+                else "places365"
+            )
+            plc_cols = [
+                f"{plc_origin}_{start_idx + i}" for i in range(plc_matrix.shape[1])
+            ]
+            df_parts.append(pd.DataFrame(plc_matrix.astype(int), columns=plc_cols))
+            edge_origins.extend([plc_origin] * plc_matrix.shape[1])
+            start_idx += plc_matrix.shape[1]
+
+        df = pd.concat(df_parts, axis=1) if df_parts else pd.DataFrame()
+
+        self._disconnect_model_signals()
+
+        new_model = SessionModel(
             self.model.im_list,
             df,
             features,
@@ -1485,32 +1488,13 @@ class MainWin(QMainWindow):
             thumbnail_data=self.model.thumbnail_data,
             thumbnails_are_embedded=self.model.thumbnails_are_embedded,
             metadata=self.model.metadata,
+            model_features=self._model_features,
+            model_names=self._model_names,
+            edge_origins=edge_origins if edge_origins else None,
         )
 
-        if oc_matrix is not None and oc_matrix.size:
-            origin = self._model_names[1].lower()
-            self.model.append_clustering_matrix(oc_matrix, origin=origin, prefix=origin)
-
-        if plc_matrix is not None and plc_matrix.size:
-            origin = self._model_names[2].lower()
-            self.model.append_clustering_matrix(plc_matrix, origin=origin, prefix=origin)
-        self.model.prune_similar_edges(prune_thr)
-
-        self.model.layoutChanged.connect(self.regroup)
-        self._overview_triplets = None
-        self.model.layoutChanged.connect(self._on_layout_changed)
-        self.model.hyperedgeModified.connect(self._on_model_hyperedge_modified)
-
-        self.audio_table.clear()
-        for name in self._model_names:
-            self.audio_table.add_model(name, self.model)
-        self.audio_table.set_use_full_images(True)
-        self.thumb_toggle_act.setChecked(True)
-        self.matrix_dock.set_model(self.model)
-        self.spatial_dock.set_model(self.model)
-        self.regroup()
-
-
+        self._set_new_model(new_model, prune_thr)
+        return True
 
     def _on_layout_changed(self):
         self._overview_triplets = None
@@ -1714,7 +1698,6 @@ class MainWin(QMainWindow):
         self._hide_legend()
 
     def regroup(self):
-        start_timer14 = time.perf_counter()
         if not self.model: 
             return
         thr = self.slider.value() / 100
@@ -1722,7 +1705,6 @@ class MainWin(QMainWindow):
 
         self.groups = rename_groups_sequentially(perform_hierarchical_grouping(self.model, thresh=thr))
         rows = build_row_data(self.groups, self.model)
-        print('regroup', time.perf_counter() - start_timer14)
         headers = [
             "Name",
             "Images",
@@ -1741,7 +1723,6 @@ class MainWin(QMainWindow):
 
         if hasattr(self, 'matrix_dock'): 
             self.matrix_dock.update_matrix()
-        print('regroup1', time.perf_counter() - start_timer14)
 
     def _update_group_similarity(self, group_item: QStandardItem):
         vals = [v for v in (group_item.child(r, SIM_COL).data(Qt.UserRole) for r in range(group_item.rowCount())) if v is not None]
