@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import h5py
 from pathlib import Path
-from typing import Dict, List, Set, Iterable, Optional
+from typing import Dict, List, Set, Iterable, Optional, Sequence, Mapping
 from PIL import Image, ExifTags, ImageOps
 import io
 from PyQt5.QtCore import QObject, pyqtSignal as Signal
@@ -297,13 +297,11 @@ class SessionModel(QObject):
 
         self.features = features                             # np.ndarray (N×D)
         self.openclip_features = openclip_features
-        self.places365_features = places365_features        
+        self.places365_features = places365_features
         self.hyperedge_avg_features = self._calculate_hyperedge_avg_features(features)
 
-        feats32 = self.features.astype(np.float32, copy=False)
-        norms = np.linalg.norm(feats32, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        self._features_unit = feats32 / norms
+        self._update_feature_norms()
+
 
         self.edge_origins = edge_origins or {name: "swin" for name in self.cat_list}
 
@@ -338,13 +336,7 @@ class SessionModel(QObject):
         self.model_features: dict[str, ModelFeatures] = model_features or {}
         self.model_names: List[str] = model_names or list(self.model_features.keys())
 
-        self.edge_to_song_index: Dict[str, int] = {}
-        self.song_edge_names: Dict[int, str] = {}
-        for name, members in self.hyperedges.items():
-            if len(members) == 1:
-                idx = int(next(iter(members)))
-                self.edge_to_song_index[name] = idx
-                self.song_edge_names[idx] = name
+        self._rebuild_song_edge_maps()
 
         # Determine the primary audio model (OpenL3 in current workflow)
         self.primary_model: str | None = None
@@ -364,45 +356,7 @@ class SessionModel(QObject):
         self.song_segment_map: Dict[int, np.ndarray] = {}
         self.song_durations = np.zeros(len(self.im_list), dtype=np.float32)
 
-        if self.primary_model:
-            mf = self.model_features.get(self.primary_model)
-            if mf:
-                seg = mf.segments
-                emb = np.asarray(seg.embeddings, dtype=np.float32)
-                if emb.ndim == 1:
-                    emb = emb.reshape(1, -1)
-                elif emb.ndim == 0:
-                    emb = np.zeros((0, 0), dtype=np.float32)
-                self.segment_embeddings = emb
-
-                self.segment_song_id = np.asarray(seg.song_id, dtype=np.int32).reshape(-1)
-                self.segment_start_s = np.asarray(seg.start_s, dtype=np.float32).reshape(-1)
-                self.segment_end_s = np.asarray(seg.end_s, dtype=np.float32).reshape(-1)
-
-                if self.segment_embeddings.size:
-                    norms = np.linalg.norm(self.segment_embeddings, axis=1, keepdims=True)
-                    norms[norms == 0] = 1.0
-                    self.segment_embeddings_unit = self.segment_embeddings / norms
-                else:
-                    self.segment_embeddings_unit = np.zeros_like(self.segment_embeddings)
-
-        emb_dim = self.segment_embeddings.shape[1] if self.segment_embeddings.ndim == 2 else 0
-        if self.segment_embeddings_unit.shape[1] != emb_dim:
-            self.segment_embeddings_unit = np.zeros((0, emb_dim), dtype=np.float32)
-
-        total_songs = len(self.im_list)
-        for idx in range(total_songs):
-            if self.segment_song_id.size:
-                indices = np.where(self.segment_song_id == idx)[0]
-            else:
-                indices = np.zeros((0,), dtype=np.int32)
-            self.song_segment_map[idx] = indices
-            if indices.size:
-                self.song_durations[idx] = float(self.segment_end_s[indices].max())
-
-        if not self.segment_embeddings.size:
-            self.segment_embeddings = np.zeros((0, emb_dim), dtype=np.float32)
-            self.segment_embeddings_unit = np.zeros((0, emb_dim), dtype=np.float32)
+        self._refresh_segment_cache()
 
         self.overview_triplets: Dict[str, tuple[int | None, ...]] | None = None
         self.compute_overview_triplets()
@@ -425,6 +379,82 @@ class SessionModel(QObject):
         n_feat = features.shape[1]
         return {name: features[list(idx)].mean(axis=0) if idx else np.zeros(n_feat)
                 for name, idx in self.hyperedges.items()}
+    def _update_feature_norms(self) -> None:
+        feats32 = np.asarray(self.features, dtype=np.float32)
+        if feats32.ndim == 1:
+            feats32 = feats32.reshape(1, -1)
+        elif feats32.ndim == 0:
+            feats32 = np.zeros((0, 0), dtype=np.float32)
+
+        if feats32.size == 0:
+            self._features_unit = feats32
+            return
+
+        norms = np.linalg.norm(feats32, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        self._features_unit = feats32 / norms
+
+    def _rebuild_song_edge_maps(self) -> None:
+        self.edge_to_song_index: Dict[str, int] = {}
+        self.song_edge_names: Dict[int, str] = {}
+        for name, members in self.hyperedges.items():
+            if len(members) == 1:
+                idx = int(next(iter(members)))
+                self.edge_to_song_index[name] = idx
+                self.song_edge_names[idx] = name
+
+    def _refresh_segment_cache(self) -> None:
+        emb_dim = 0
+        if self.primary_model:
+            mf = self.model_features.get(self.primary_model)
+        else:
+            mf = None
+
+        if mf:
+            seg = mf.segments
+            emb = np.asarray(seg.embeddings, dtype=np.float32)
+            if emb.ndim == 1:
+                emb = emb.reshape(1, -1)
+            elif emb.ndim == 0:
+                emb = np.zeros((0, 0), dtype=np.float32)
+            self.segment_embeddings = emb
+
+            self.segment_song_id = np.asarray(seg.song_id, dtype=np.int32).reshape(-1)
+            self.segment_start_s = np.asarray(seg.start_s, dtype=np.float32).reshape(-1)
+            self.segment_end_s = np.asarray(seg.end_s, dtype=np.float32).reshape(-1)
+
+            if self.segment_embeddings.size:
+                norms = np.linalg.norm(self.segment_embeddings, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                self.segment_embeddings_unit = self.segment_embeddings / norms
+            else:
+                self.segment_embeddings_unit = np.zeros_like(self.segment_embeddings)
+            emb_dim = self.segment_embeddings.shape[1] if self.segment_embeddings.ndim == 2 else 0
+        else:
+            self.segment_embeddings = np.zeros((0, 0), dtype=np.float32)
+            self.segment_embeddings_unit = np.zeros((0, 0), dtype=np.float32)
+            self.segment_song_id = np.zeros((0,), dtype=np.int32)
+            self.segment_start_s = np.zeros((0,), dtype=np.float32)
+            self.segment_end_s = np.zeros((0,), dtype=np.float32)
+
+        if self.segment_embeddings_unit.shape[1] != emb_dim:
+            self.segment_embeddings_unit = np.zeros((0, emb_dim), dtype=np.float32)
+
+        total_songs = len(self.im_list)
+        self.song_segment_map = {}
+        self.song_durations = np.zeros(total_songs, dtype=np.float32)
+        for idx in range(total_songs):
+            if self.segment_song_id.size:
+                indices = np.where(self.segment_song_id == idx)[0]
+            else:
+                indices = np.zeros((0,), dtype=np.int32)
+            self.song_segment_map[idx] = indices
+            if indices.size:
+                self.song_durations[idx] = float(self.segment_end_s[indices].max())
+
+        if not self.segment_embeddings.size:
+            self.segment_embeddings = np.zeros((0, emb_dim), dtype=np.float32)
+            self.segment_embeddings_unit = np.zeros((0, emb_dim), dtype=np.float32)
 
     @staticmethod
     def _sanitize_metadata(df: pd.DataFrame) -> pd.DataFrame:
@@ -614,6 +644,239 @@ class SessionModel(QObject):
             for edge in changed_edges:
                 self.hyperedgeModified.emit(edge)
 
+    def add_songs(
+        self,
+        files: Sequence[str],
+        features: np.ndarray,
+        edge_names: Sequence[str],
+        model_features: Mapping[str, ModelFeatures],
+        *,
+        origin: str = "song",
+    ) -> None:
+        """Append new songs with their audio features to the session."""
+
+        n_new = len(files)
+        if n_new == 0:
+            return
+        if len(edge_names) != n_new:
+            raise ValueError("edge_names length must match files length")
+
+        new_features = np.asarray(features, dtype=np.float32)
+        if new_features.ndim == 1:
+            new_features = new_features.reshape(1, -1)
+        elif new_features.ndim == 0:
+            new_features = np.zeros((0, 0), dtype=np.float32)
+        if new_features.shape[0] != n_new:
+            raise ValueError("features row count must match number of files")
+
+        if self.features.size:
+            if self.features.ndim != 2:
+                raise ValueError("session features array must be 2D")
+            if new_features.size and self.features.shape[1] != new_features.shape[1]:
+                raise ValueError("feature dimension mismatch")
+        else:
+            # ensure features array has the correct shape for stacking later
+            self.features = np.zeros((0, new_features.shape[1]), dtype=np.float32)
+
+        start_idx = len(self.im_list)
+        self.im_list.extend(str(p) for p in files)
+
+        # Maintain thumbnail list length if thumbnails are stored
+        if self.thumbnail_data is not None:
+            if not isinstance(self.thumbnail_data, list):
+                self.thumbnail_data = list(self.thumbnail_data)
+            placeholder = b"" if self.thumbnails_are_embedded else ""
+            self.thumbnail_data.extend([placeholder] * n_new)
+
+        if isinstance(self.metadata, pd.DataFrame):
+            new_meta = pd.DataFrame([{"image_path": path} for path in files])
+            self.metadata = pd.concat([self.metadata, new_meta], ignore_index=True)
+
+        # Extend dataframe with empty rows for the new songs
+        base_cols = list(self.df_edges.columns)
+        if base_cols:
+            new_rows = pd.DataFrame(0, index=range(n_new), columns=base_cols, dtype=int)
+        else:
+            new_rows = pd.DataFrame(index=range(n_new))
+        self.df_edges = pd.concat([self.df_edges, new_rows], ignore_index=True)
+
+        for name in edge_names:
+            if name in self.df_edges.columns:
+                raise ValueError(f"Hyperedge '{name}' already exists")
+            self.df_edges[name] = 0
+
+        self.cat_list.extend(edge_names)
+
+        # Prepare new feature vectors for hyperedges
+        for offset, name in enumerate(edge_names):
+            row_idx = start_idx + offset
+            self.df_edges.at[row_idx, name] = 1
+            self.hyperedges[name] = {row_idx}
+            self.image_mapping[row_idx] = {name}
+            vec = (
+                new_features[offset].astype(np.float32, copy=False)
+                if new_features.size
+                else np.zeros(self.features.shape[1], dtype=np.float32)
+            )
+            self.hyperedge_avg_features[name] = vec
+            self.status_map[name] = {"uuid": str(uuid.uuid4()), "status": "New"}
+            color_idx = len(self.edge_colors)
+            cmap_hues = max(color_idx + 1, 16)
+            self.edge_colors[name] = pg.mkColor(pg.intColor(color_idx, hues=cmap_hues)).name()
+            self.edge_origins[name] = origin
+            self.edge_seen_times[name] = 0.0
+
+        if new_features.size:
+            self.features = np.vstack([self.features, new_features])
+        else:
+            self.features = np.vstack([self.features, np.zeros((n_new, self.features.shape[1]), dtype=np.float32)])
+
+        self._update_feature_norms()
+
+        # Merge model features
+        for model_name, mf_new in model_features.items():
+            seg_new = mf_new.segments
+            songs_new = mf_new.songs
+
+            emb_new = np.asarray(seg_new.embeddings, dtype=np.float32)
+            if emb_new.ndim == 1:
+                emb_new = emb_new.reshape(1, -1)
+            elif emb_new.ndim == 0:
+                emb_new = np.zeros((0, 0), dtype=np.float32)
+
+            song_id_new = np.asarray(seg_new.song_id, dtype=np.int32).reshape(-1)
+            start_new = np.asarray(seg_new.start_s, dtype=np.float32).reshape(-1)
+            end_new = np.asarray(seg_new.end_s, dtype=np.float32).reshape(-1)
+
+            centroid_new = np.asarray(songs_new.centroid, dtype=np.float32)
+            if centroid_new.ndim == 1:
+                centroid_new = centroid_new.reshape(1, -1)
+            elif centroid_new.ndim == 0:
+                centroid_new = np.zeros((0, 0), dtype=np.float32)
+
+            stats_new = np.asarray(songs_new.stats2D, dtype=np.float32)
+            if stats_new.ndim == 1:
+                stats_new = stats_new.reshape(1, -1)
+            elif stats_new.ndim == 0:
+                stats_new = np.zeros((0, 0), dtype=np.float32)
+
+            song_ids_new = np.asarray(songs_new.song_id, dtype=np.int32).reshape(-1)
+            paths_new = list(songs_new.path)
+
+            existing = self.model_features.get(model_name)
+            if existing:
+                seg_old = existing.segments
+                songs_old = existing.songs
+
+                emb_old = np.asarray(seg_old.embeddings, dtype=np.float32)
+                if emb_old.ndim == 1:
+                    emb_old = emb_old.reshape(1, -1)
+                elif emb_old.ndim == 0:
+                    emb_old = np.zeros((0, 0), dtype=np.float32)
+                if emb_old.size == 0 and emb_new.size:
+                    emb_old = np.zeros((0, emb_new.shape[1]), dtype=np.float32)
+                if emb_old.size and emb_new.size and emb_old.shape[1] != emb_new.shape[1]:
+                    raise ValueError(f"Segment embedding dimension mismatch for model '{model_name}'")
+
+                seg_embeddings = (
+                    np.vstack([emb_old, emb_new]) if emb_new.size else emb_old
+                )
+
+                song_id_old = np.asarray(seg_old.song_id, dtype=np.int32).reshape(-1)
+                start_old = np.asarray(seg_old.start_s, dtype=np.float32).reshape(-1)
+                end_old = np.asarray(seg_old.end_s, dtype=np.float32).reshape(-1)
+
+                seg_song_id = np.concatenate([song_id_old, song_id_new]) if song_id_new.size else song_id_old
+                seg_start = np.concatenate([start_old, start_new]) if start_new.size else start_old
+                seg_end = np.concatenate([end_old, end_new]) if end_new.size else end_old
+
+                cen_old = np.asarray(songs_old.centroid, dtype=np.float32)
+                if cen_old.ndim == 1:
+                    cen_old = cen_old.reshape(1, -1)
+                elif cen_old.ndim == 0:
+                    cen_old = np.zeros((0, 0), dtype=np.float32)
+                if cen_old.size == 0 and centroid_new.size:
+                    cen_old = np.zeros((0, centroid_new.shape[1]), dtype=np.float32)
+                if cen_old.size and centroid_new.size and cen_old.shape[1] != centroid_new.shape[1]:
+                    raise ValueError(f"Centroid dimension mismatch for model '{model_name}'")
+
+                centroid = (
+                    np.vstack([cen_old, centroid_new]) if centroid_new.size else cen_old
+                )
+
+                stats_old = np.asarray(songs_old.stats2D, dtype=np.float32)
+                if stats_old.ndim == 1:
+                    stats_old = stats_old.reshape(1, -1)
+                elif stats_old.ndim == 0:
+                    stats_old = np.zeros((0, 0), dtype=np.float32)
+                if stats_old.size == 0 and stats_new.size:
+                    stats_old = np.zeros((0, stats_new.shape[1]), dtype=np.float32)
+                if stats_old.size and stats_new.size and stats_old.shape[1] != stats_new.shape[1]:
+                    raise ValueError(f"Song feature dimension mismatch for model '{model_name}'")
+
+                stats = (
+                    np.vstack([stats_old, stats_new]) if stats_new.size else stats_old
+                )
+
+                song_ids_old = np.asarray(songs_old.song_id, dtype=np.int32).reshape(-1)
+                song_ids = np.concatenate([song_ids_old, song_ids_new]) if song_ids_new.size else song_ids_old
+                paths = list(songs_old.path) + paths_new
+
+                combined_segments = SegmentLevel(
+                    embeddings=seg_embeddings,
+                    song_id=seg_song_id,
+                    start_s=seg_start,
+                    end_s=seg_end,
+                )
+                combined_songs = SongLevel(
+                    centroid=centroid,
+                    stats2D=stats,
+                    song_id=song_ids,
+                    path=paths,
+                )
+                self.model_features[model_name] = ModelFeatures(
+                    name=model_name,
+                    segments=combined_segments,
+                    songs=combined_songs,
+                )
+            else:
+                self.model_features[model_name] = ModelFeatures(
+                    name=model_name,
+                    segments=SegmentLevel(
+                        embeddings=emb_new,
+                        song_id=song_id_new,
+                        start_s=start_new,
+                        end_s=end_new,
+                    ),
+                    songs=SongLevel(
+                        centroid=centroid_new,
+                        stats2D=stats_new,
+                        song_id=song_ids_new,
+                        path=paths_new,
+                    ),
+                )
+                if model_name not in self.model_names:
+                    self.model_names.append(model_name)
+
+        if not self.primary_model:
+            if self.model_names:
+                for cand in self.model_names:
+                    if cand in self.model_features:
+                        self.primary_model = cand
+                        break
+            elif self.model_features:
+                self.primary_model = next(iter(self.model_features))
+
+        self._rebuild_song_edge_maps()
+        self._refresh_segment_cache()
+
+        self.umap_embedding = None
+        self.image_umap = {}
+
+        self.overview_triplets = None
+        self.similarityDirty.emit()
+        self.layoutChanged.emit()
+
     def delete_hyperedge(self, name: str, orphan_name: str = "orphaned images") -> None:
         if name not in self.hyperedges:
             return
@@ -704,7 +967,95 @@ class SessionModel(QObject):
         mat = np.stack([self.hyperedge_avg_features[n] for n in names])
         sims = SIM_METRIC(ref.reshape(1, -1), mat)[0]
         return dict(zip(names, sims))
-    
+
+    def _segment_similarity(self, song_idx: int, *, average: bool) -> Dict[int, float]:
+        if not (0 <= song_idx < len(self.im_list)):
+            return {}
+        if self.segment_embeddings_unit.size == 0:
+            return {}
+
+        base_indices = self.song_segment_map.get(song_idx)
+        if base_indices is None or base_indices.size == 0:
+            return {}
+
+        base_vecs = self.segment_embeddings_unit[base_indices]
+        if base_vecs.size == 0:
+            return {}
+
+        results: Dict[int, float] = {}
+        for other_idx, seg_ids in self.song_segment_map.items():
+            if seg_ids.size == 0:
+                continue
+            other_vecs = self.segment_embeddings_unit[seg_ids]
+            if other_vecs.size == 0:
+                continue
+            sims = np.matmul(base_vecs, other_vecs.T)
+            if sims.size == 0:
+                continue
+            value = float(np.mean(sims)) if average else float(np.max(sims))
+            results[other_idx] = value
+
+        return results
+
+    def segment_similarity_single(self, song_idx: int) -> Dict[int, float]:
+        """Return similarity scores using the best matching segment for each song."""
+
+        return self._segment_similarity(song_idx, average=False)
+
+    def segment_similarity_average(self, song_idx: int) -> Dict[int, float]:
+        """Return similarity scores averaged over all segment comparisons."""
+
+        return self._segment_similarity(song_idx, average=True)
+
+    def song_level_similarity(self, song_idx: int) -> Dict[int, float]:
+        """Return cosine similarity between song-level feature vectors."""
+
+        if not (0 <= song_idx < len(self.im_list)):
+            return {}
+        if not self.primary_model:
+            return {}
+
+        mf = self.model_features.get(self.primary_model)
+        if not mf:
+            return {}
+
+        stats = np.asarray(mf.songs.stats2D, dtype=np.float32)
+        if stats.ndim == 1:
+            stats = stats.reshape(1, -1)
+        elif stats.ndim == 0 or stats.size == 0:
+            return {}
+
+        song_ids = np.asarray(mf.songs.song_id, dtype=np.int32).reshape(-1)
+        if song_ids.size != stats.shape[0]:
+            song_ids = np.arange(stats.shape[0], dtype=np.int32)
+
+        id_to_idx = {int(sid): i for i, sid in enumerate(song_ids)}
+        ref_idx = id_to_idx.get(int(song_idx))
+        if ref_idx is None:
+            return {}
+
+        norms = np.linalg.norm(stats, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        stats_unit = stats / norms
+
+        ref_vec = stats_unit[ref_idx]
+        sims = stats_unit @ ref_vec
+        return {int(song_ids[i]): float(sims[i]) for i in range(len(song_ids))}
+
+    def has_segment_features(self) -> bool:
+        return bool(self.segment_embeddings_unit.size)
+
+    def has_song_level_features(self) -> bool:
+        if not self.primary_model:
+            return False
+        mf = self.model_features.get(self.primary_model)
+        if not mf:
+            return False
+        stats = np.asarray(mf.songs.stats2D, dtype=np.float32)
+        if stats.ndim == 1:
+            stats = stats.reshape(1, -1)
+        return stats.ndim == 2 and stats.size > 0
+
     def similarity_std(self, name: str) -> float | None:
         idxs = list(self.hyperedges.get(name, []))
         if not idxs:

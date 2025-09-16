@@ -195,6 +195,40 @@ class NewSessionDialog(QDialog):
     def parameters(self) -> tuple[float, float]:
         return float(self.segment_edit.text()), float(self.hop_edit.text())
 
+class AddFolderDialog(QDialog):
+    """Dialog to configure feature extraction when adding new audio."""
+
+    def __init__(self, file_count: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Audio")
+
+        layout = QVBoxLayout(self)
+        info = QLabel(
+            f"Found {file_count} new audio files.\n\n"
+            "Features will be extracted with OpenL3 (mel256/music/512, layer -4). "
+            "Adjust the segment settings if desired."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        layout.addWidget(QLabel("Segment length (seconds):"))
+        self.segment_edit = QLineEdit("30.0")
+        layout.addWidget(self.segment_edit)
+
+        layout.addWidget(QLabel("Hop length (seconds):"))
+        self.hop_edit = QLineEdit("15.0")
+        layout.addWidget(self.hop_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Extract and add")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.segment_edit.setFocus()
+
+    def parameters(self) -> tuple[float, float]:
+        return float(self.segment_edit.text()), float(self.hop_edit.text())
 
 
 class HyperEdgeTree(QTreeView):
@@ -381,6 +415,17 @@ class MainWin(QMainWindow):
         src_index = self._source_index(index)
         return src_model.itemFromIndex(src_index)
 
+    def _selected_edge_name(self) -> str | None:
+        selection = self.tree.selectionModel()
+        if not selection:
+            return None
+        indexes = selection.selectedRows(0)
+        if not indexes:
+            return None
+        item = self._item_from_index(indexes[0])
+        if item is None or item.hasChildren():
+            return None
+        return item.text().strip()
 
     def _vector_for(self, name: str) -> np.ndarray | None:
         avg = self.model.hyperedge_avg_features
@@ -434,6 +479,149 @@ class MainWin(QMainWindow):
         self._source_model().sort(SIM_COL, Qt.DescendingOrder)
         self._similarity_ref = ref_name
         self._similarity_computed = True
+
+    def compute_single_segment_similarity(self) -> None:
+        self._compute_segment_similarity(average=False)
+
+    def compute_average_segment_similarity(self) -> None:
+        self._compute_segment_similarity(average=True)
+
+    def _compute_segment_similarity(self, *, average: bool) -> None:
+        if not self.model:
+            return
+        if not self.model.has_segment_features():
+            QMessageBox.warning(
+                self,
+                "No segment features",
+                "This session does not contain segment-level audio features.",
+            )
+            return
+
+        ref_name = self._selected_edge_name()
+        if not ref_name:
+            QMessageBox.warning(
+                self,
+                "No selection",
+                "Select a hyperedge that represents a single song.",
+            )
+            return
+
+        song_idx = self.model.edge_to_song_index.get(ref_name)
+        if song_idx is None:
+            QMessageBox.warning(
+                self,
+                "Not a song",
+                "Select a hyperedge that represents a single song.",
+            )
+            return
+
+        scores = (
+            self.model.segment_similarity_average(song_idx)
+            if average
+            else self.model.segment_similarity_single(song_idx)
+        )
+
+        if not scores:
+            QMessageBox.information(
+                self,
+                "No segments",
+                "No segment features were found for the selected song.",
+            )
+            return
+
+        sim_map = self._scores_to_edge_map(scores)
+        if not sim_map:
+            QMessageBox.information(
+                self,
+                "No results",
+                "No comparable songs were found.",
+            )
+            return
+
+        self._apply_similarity_results(sim_map, ref_name)
+
+    def compute_song_level_similarity(self) -> None:
+        if not self.model:
+            return
+        if not self.model.has_song_level_features():
+            QMessageBox.warning(
+                self,
+                "No song-level features",
+                "This session does not contain song-level audio features.",
+            )
+            return
+
+        ref_name = self._selected_edge_name()
+        if not ref_name:
+            QMessageBox.warning(
+                self,
+                "No selection",
+                "Select a hyperedge that represents a single song.",
+            )
+            return
+
+        song_idx = self.model.edge_to_song_index.get(ref_name)
+        if song_idx is None:
+            QMessageBox.warning(
+                self,
+                "Not a song",
+                "Select a hyperedge that represents a single song.",
+            )
+            return
+
+        scores = self.model.song_level_similarity(song_idx)
+        if not scores:
+            QMessageBox.information(
+                self,
+                "No results",
+                "No comparable songs were found.",
+            )
+            return
+
+        sim_map = self._scores_to_edge_map(scores)
+        if not sim_map:
+            QMessageBox.information(
+                self,
+                "No results",
+                "No comparable songs were found.",
+            )
+            return
+
+        self._apply_similarity_results(sim_map, ref_name)
+
+    def _scores_to_edge_map(self, scores: Mapping[int, float]) -> dict[str, float]:
+        if not self.model:
+            return {}
+        mapping: dict[str, float] = {}
+        for idx, score in scores.items():
+            edge = self.model.song_edge_names.get(int(idx))
+            if edge:
+                mapping[edge] = float(score)
+        return mapping
+
+    def _apply_similarity_results(self, sim_map: Mapping[str, float], ref_name: str) -> None:
+        model = self.tree.model()
+        if model is None:
+            return
+        root = (
+            model.sourceModel().invisibleRootItem()
+            if isinstance(model, QSortFilterProxyModel)
+            else model.invisibleRootItem()
+        )
+        self._update_similarity_items(root, sim_map)
+        self._update_intersection_items(root, {})
+        self._source_model().sort(SIM_COL, Qt.DescendingOrder)
+        self._similarity_ref = ref_name
+        self._similarity_computed = True
+
+    def _update_similarity_buttons_state(self) -> None:
+        has_model = self.model is not None
+        has_segments = bool(has_model and self.model.has_segment_features())
+        has_song_vectors = bool(has_model and self.model.has_song_level_features())
+        self.btn_segment_single.setEnabled(has_segments)
+        self.btn_segment_average.setEnabled(has_segments)
+        self.btn_song_similarity.setEnabled(has_song_vectors)
+
 
     def _update_similarity_items(self, parent: QStandardItem, sim_map):
         for r in range(parent.rowCount()):
@@ -603,7 +791,16 @@ class MainWin(QMainWindow):
 
         self.btn_sim = QPushButton("Show similarity and intersection")
         self.btn_sim.clicked.connect(self.compute_similarity)
-        
+
+        self.btn_segment_single = QPushButton("Single segment similarity")
+        self.btn_segment_single.clicked.connect(self.compute_single_segment_similarity)
+
+        self.btn_segment_average = QPushButton("Average segment similarity")
+        self.btn_segment_average.clicked.connect(self.compute_average_segment_similarity)
+
+        self.btn_song_similarity = QPushButton("Song-level similarity")
+        self.btn_song_similarity.clicked.connect(self.compute_song_level_similarity)
+
         self.btn_add_hyperedge = QPushButton("Add Hyperedge")
         self.btn_add_hyperedge.clicked.connect(self.on_add_hyperedge)
         
@@ -649,6 +846,9 @@ class MainWin(QMainWindow):
 
 
         toolbar_layout.addWidget(self.btn_sim)
+        toolbar_layout.addWidget(self.btn_segment_single)
+        toolbar_layout.addWidget(self.btn_segment_average)
+        toolbar_layout.addWidget(self.btn_song_similarity)        
         toolbar_layout.addWidget(self.btn_add_hyperedge)
         toolbar_layout.addWidget(self.btn_del_hyperedge)
 
@@ -702,7 +902,7 @@ class MainWin(QMainWindow):
         self.label.setAlignment(Qt.AlignCenter)
         toolbar_layout.insertWidget(0, self.label)
         toolbar_layout.insertWidget(1, self.slider)
-
+        self._update_similarity_buttons_state()
 
         # ----------------- DOCK LAYOUT ARRANGEMENT ------------------------------------
         # Arrange the created docks to match the wireframe.
@@ -759,32 +959,193 @@ class MainWin(QMainWindow):
         self._model_features: dict[str, ModelFeatures] = {}
         self.slider.valueChanged.connect(self.regroup)
 
-
+    def _generate_unique_edge_names(self, files: Sequence[str]) -> list[str]:
+        existing = set(self.model.cat_list) if self.model else set()
+        counts: dict[str, int] = {}
+        names: list[str] = []
+        for path in files:
+            base = Path(path).stem
+            count = counts.get(base, 0)
+            candidate = base if count == 0 else f"{base} ({count + 1})"
+            while candidate in existing:
+                count += 1
+                candidate = f"{base} ({count + 1})"
+            counts[base] = count + 1
+            existing.add(candidate)
+            names.append(candidate)
+        return names
 
     def import_folder(self) -> None:
+        if not self.model:
+            QMessageBox.warning(self, "No Session", "Please load or create a session first.")
+            return
+
         directory = QFileDialog.getExistingDirectory(self, "Select folder")
         if not directory:
             return
-        path = Path(directory)
-        files = [str(p) for p in path.rglob("*") if p.suffix.lower() in {".wav", ".mp3"}]
-        if not files:
-            QMessageBox.information(self, "No Audio", "No .wav or .mp3 files found.")
-            return
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Process Audio")
-        msg.setText(f"Found {len(files)} audio files. Process?")
-        process_btn = msg.addButton("Process", QMessageBox.AcceptRole)
-        msg.addButton(QMessageBox.Cancel)
-        msg.exec_()
-        if msg.clickedButton() is process_btn:
-            self.process_audio_files(files)
 
-    def process_audio_files(self, files: list[str]) -> None:
-        QMessageBox.information(
-            self,
-            "Not Supported",
-            "Adding audio to an existing session is not supported in the current "
-            "song-based workflow.",)
+        files = get_audio_files(directory)
+        if not files:
+            QMessageBox.information(self, "No Audio", "No supported audio files found.")
+            return
+
+        existing = {str(Path(p).resolve()) for p in self.model.im_list}
+        new_files: list[str] = []
+        for f in files:
+            resolved = str(Path(f).resolve())
+            if resolved not in existing:
+                new_files.append(resolved)
+
+        skipped_count = len(files) - len(new_files)
+        if not new_files:
+            QMessageBox.information(
+                self,
+                "No New Audio",
+                "All audio files in the selected folder are already part of the session.",
+            )
+            return
+
+        dlg = AddFolderDialog(len(new_files), self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        try:
+            segment_seconds, hop_seconds = dlg.parameters()
+        except Exception:
+            QMessageBox.warning(self, "Invalid Input", "Enter valid numbers.")
+            return
+
+        self.process_audio_files(
+            new_files,
+            segment_seconds=segment_seconds,
+            hop_seconds=hop_seconds,
+            skipped_count=skipped_count,
+        )
+
+    def process_audio_files(
+        self,
+        files: Sequence[str],
+        *,
+        segment_seconds: float,
+        hop_seconds: float | None = None,
+        skipped_count: int = 0,
+    ) -> None:
+        if not self.model:
+            QMessageBox.warning(self, "No Session", "Please load or create a session first.")
+            return
+
+        files = [str(Path(f).resolve()) for f in files]
+        if not files:
+            return
+
+        app = QApplication.instance()
+        if app:
+            app.setOverrideCursor(Qt.WaitCursor)
+
+        try:
+            extractor = create_default_openl3_extractor(
+                segment_seconds=segment_seconds,
+                hop_seconds=hop_seconds,
+            )
+        except Exception as e:
+            if app:
+                app.restoreOverrideCursor()
+            QMessageBox.critical(self, "Model Error", str(e))
+            return
+
+        try:
+            Xseg, rows, songs = extractor.extract_segments_and_songs(files)
+        except Exception as e:
+            if app:
+                app.restoreOverrideCursor()
+            QMessageBox.critical(self, "Extraction Error", str(e))
+            return
+
+        if app:
+            app.restoreOverrideCursor()
+
+        base_idx = len(self.model.im_list)
+        file_to_global = {path: base_idx + i for i, path in enumerate(files)}
+        file_to_local = {path: i for i, path in enumerate(files)}
+
+        if rows:
+            seg_song_ids = np.array([file_to_global.get(r["file"], -1) for r in rows], dtype=np.int32)
+            start_s = np.array([r["start_s"] for r in rows], dtype=np.float32)
+            end_s = np.array([r["end_s"] for r in rows], dtype=np.float32)
+        else:
+            seg_song_ids = np.zeros((0,), dtype=np.int32)
+            start_s = np.zeros((0,), dtype=np.float32)
+            end_s = np.zeros((0,), dtype=np.float32)
+
+        segments = SegmentLevel(
+            embeddings=Xseg.astype(np.float32, copy=False),
+            song_id=seg_song_ids,
+            start_s=start_s,
+            end_s=end_s,
+        )
+
+        centroid_dim = extractor.output_dim()
+        stats_dim = centroid_dim * 2
+        centroids = np.zeros((len(files), centroid_dim), dtype=np.float32)
+        stats = np.zeros((len(files), stats_dim), dtype=np.float32)
+        for song in songs:
+            local_idx = file_to_local.get(song.file)
+            if local_idx is None:
+                continue
+            centroids[local_idx] = song.centroid_D.astype(np.float32, copy=False)
+            stats[local_idx] = song.stats_2D.astype(np.float32, copy=False)
+
+        song_ids = np.array([file_to_global[f] for f in files], dtype=np.int32)
+        song_level = SongLevel(
+            centroid=centroids,
+            stats2D=stats,
+            song_id=song_ids,
+            path=list(files),
+        )
+
+        model_name = extractor.model_name
+        model_feats = {
+            model_name: ModelFeatures(
+                name=model_name,
+                segments=segments,
+                songs=song_level,
+            )
+        }
+
+        edge_names = self._generate_unique_edge_names(files)
+        self.model.add_songs(files, song_level.stats2D, edge_names, model_feats)
+
+        self._model_features = getattr(self.model, "model_features", {})
+        self._model_names = getattr(self.model, "model_names", list(self._model_features.keys()))
+        self.audio_table.clear()
+        for name in self._model_names:
+            self.audio_table.add_model(name, self.model)
+
+        self._update_similarity_buttons_state()
+
+        missing_by_model = self._find_missing_songs(model_feats, files)
+        sections: list[str] = []
+        if skipped_count:
+            sections.append(
+                f"{skipped_count} file(s) were already in the session and were skipped."
+            )
+
+        missing_lines: list[str] = []
+        for model_name, missing in missing_by_model.items():
+            if not missing:
+                continue
+            display_names = ", ".join(Path(p).name for p in missing)
+            missing_lines.append(
+                f"• {model_name}: {len(missing)} song(s) ({display_names})"
+            )
+
+        if missing_lines:
+            sections.append(
+                "Audio features could not be extracted for:\n" + "\n".join(missing_lines)
+            )
+
+        if sections:
+            QMessageBox.information(self, "Import Summary", "\n\n".join(sections))
 
 
 
@@ -1099,7 +1460,7 @@ class MainWin(QMainWindow):
             self.audio_table.add_model(name, self.model)
         self.audio_table.set_use_full_images(True)
         self.thumb_toggle_act.setChecked(True)
-
+        self._update_similarity_buttons_state()
         self.matrix_dock.set_model(self.model)
         self.spatial_dock.set_model(self.model)
         self.regroup()
@@ -1163,7 +1524,7 @@ class MainWin(QMainWindow):
             self.audio_table.add_model(name, self.model)
         self.audio_table.set_use_full_images(True)
         self.thumb_toggle_act.setChecked(True)
-
+        self._update_similarity_buttons_state()
         self.matrix_dock.set_model(self.model)
         self.spatial_dock.set_model(self.model)
         self.regroup()
