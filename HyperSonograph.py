@@ -51,7 +51,7 @@ from PyQt5.QtCore import (
     QSortFilterProxyModel,
     QRectF
 )
-
+from typing import Mapping, Sequence
 from utils.data_loader import (
     DATA_DIRECTORY, get_h5_files_in_directory, load_session_data
 )
@@ -62,7 +62,7 @@ from utils.audio_schema import SegmentLevel, SongLevel, ModelFeatures
 
 from utils.spatial_viewQv4 import SpatialViewQDock, HyperedgeItem
 from utils.feature_extraction import (
-    AudioFeatureExtractorBase,    
+    AudioFeatureExtractorBase,
     CLAPFeatureExtractor,
     MERTFeatureExtractor,
     OpenL3FeatureExtractor,
@@ -528,6 +528,73 @@ class MainWin(QMainWindow):
             return {}
         return self.model.compute_overview_triplets()
 
+    def _find_missing_songs(
+        self,
+        model_features: Mapping[str, ModelFeatures],
+        files: Sequence[str],
+    ) -> dict[str, list[str]]:
+        """Return songs without usable audio features for each model."""
+
+        missing: dict[str, list[str]] = {}
+        total = len(files)
+        if total == 0:
+            return missing
+
+        for model_name, feats in model_features.items():
+            songs = getattr(feats, "songs", None)
+            if songs is None:
+                continue
+
+            stats = np.asarray(getattr(songs, "stats2D", np.empty((0, 0))), dtype=np.float32)
+            if stats.ndim != 2:
+                stats = np.atleast_2d(stats)
+
+            if stats.shape[0] >= total and stats.size:
+                mask = np.linalg.norm(stats[:total], axis=1) < 1e-8
+                missing_idx = [i for i, flag in enumerate(mask) if flag]
+            else:
+                song_ids = np.asarray(getattr(songs, "song_id", []), dtype=np.int32)
+                available = {int(i) for i in song_ids.tolist()} if song_ids.size else set()
+                missing_idx = [i for i in range(total) if i not in available]
+
+            if missing_idx:
+                missing[model_name] = [files[i] for i in missing_idx]
+
+        return missing
+
+
+    def _show_processing_summary(
+        self,
+        empty_removed: int,
+        missing_by_model: Mapping[str, Sequence[str]],
+    ) -> None:
+        """Display a summary of clustering removals and missing songs."""
+
+        sections: list[str] = []
+        if empty_removed > 0:
+            sections.append(
+                f"{empty_removed} empty hyperedges were removed after clustering."
+            )
+
+        missing_lines: list[str] = []
+        for model_name, songs in missing_by_model.items():
+            if not songs:
+                continue
+            display_names = ", ".join(Path(p).name for p in songs)
+            missing_lines.append(
+                f"• {model_name}: {len(songs)} song(s) ({display_names})"
+            )
+
+        if missing_lines:
+            sections.append(
+                "Audio features could not be extracted for:\n" + "\n".join(missing_lines)
+            )
+
+        if not sections:
+            return
+
+        QMessageBox.information(self, "Processing Summary", "\n\n".join(sections))
+
 
     def _update_intersection_items(self, parent: QStandardItem, inter_map):
         for r in range(parent.rowCount()):
@@ -826,6 +893,7 @@ class MainWin(QMainWindow):
         start_idx = len(self.model.im_list)
         file_index = {f: start_idx + i for i, f in enumerate(files)}
         print('stsd',start_idx)
+        missing_by_model: dict[str, list[str]] = {}
         for ext in extractors:
             Xseg, rows, songs = ext.extract_segments_and_songs(files)
 
@@ -915,6 +983,7 @@ class MainWin(QMainWindow):
                 self._model_names.append(ext.model_name)
 
             if missing_files:
+                missing_by_model[ext.model_name] = missing_files
                 logging.warning(
                     "No features extracted for %d file(s): %s",
                     len(missing_files),
@@ -941,6 +1010,7 @@ class MainWin(QMainWindow):
         app = QApplication.instance()
         if app:
             app.setOverrideCursor(Qt.WaitCursor)
+        base_empty_removed = 0
         try:
             matrix, _ = temi_cluster(
                 features, out_dim=n_edges, threshold=THRESHOLD_DEFAULT
@@ -949,6 +1019,7 @@ class MainWin(QMainWindow):
             empty_cols = np.where(matrix.sum(axis=0) == 0)[0]
             if len(empty_cols) > 0:
                 matrix = np.delete(matrix, empty_cols, axis=1)
+                base_empty_removed = len(empty_cols)
         except Exception as e:
             if app:
                 app.restoreOverrideCursor()
@@ -956,6 +1027,9 @@ class MainWin(QMainWindow):
             return
         if app:
             app.restoreOverrideCursor()
+
+        self._show_processing_summary(base_empty_removed, missing_by_model)
+
 
         df = pd.DataFrame(
             matrix.astype(int),
@@ -1180,6 +1254,8 @@ class MainWin(QMainWindow):
         app = QApplication.instance()
         if app:
             app.setOverrideCursor(Qt.WaitCursor)
+        base_empty_removed = 0
+        missing_by_model: dict[str, list[str]] = {}            
         try:
             matrices: dict[str, np.ndarray] = {}
             features_by_model: dict[str, np.ndarray] = {}
@@ -1200,12 +1276,24 @@ class MainWin(QMainWindow):
                     start_s=np.array([r["start_s"] for r in rows], dtype=np.float32),
                     end_s=np.array([r["end_s"] for r in rows], dtype=np.float32),
                 )
-                centroids = np.vstack([s.centroid_D for s in songs]) if songs else np.zeros((0, ext.output_dim()))
-                stats = np.vstack([s.stats_2D for s in songs]) if songs else np.zeros((0, 2 * ext.output_dim()))
+                centroid_dim = ext.output_dim()
+                stats_dim = 2 * centroid_dim
+                if songs:
+                    centroids = np.vstack([s.centroid_D for s in songs]).astype(np.float32, copy=False)
+                    stats = np.vstack([s.stats_2D for s in songs]).astype(np.float32, copy=False)
+                else:
+                    centroids = np.zeros((0, centroid_dim), dtype=np.float32)
+                    stats = np.zeros((0, stats_dim), dtype=np.float32)
+                song_ids = np.array([file_index[s.file] for s in songs], dtype=np.int32)
+                padded_centroid = np.zeros((len(files), centroid_dim), dtype=np.float32)
+                padded_stats = np.zeros((len(files), stats_dim), dtype=np.float32)
+                if song_ids.size:
+                    padded_centroid[song_ids] = centroids
+                    padded_stats[song_ids] = stats
                 song_level = SongLevel(
-                    centroid=centroids,
-                    stats2D=stats,
-                    song_id=np.arange(len(files)),
+                    centroid=padded_centroid,
+                    stats2D=padded_stats,
+                    song_id=np.arange(len(files), dtype=np.int32),
                     path=files,
                 )
                 mf = ModelFeatures(name=name, segments=segs, songs=song_level)
@@ -1217,12 +1305,9 @@ class MainWin(QMainWindow):
                 if len(empty) > 0:
                     matrix = np.delete(matrix, empty, axis=1)
                     if name == models[0]:
-                        QMessageBox.information(
-                            self,
-                            "Empty Hyperedges Removed",
-                            f"{len(empty)} empty hyperedges were removed after clustering.",
-                        )
+                        base_empty_removed = len(empty)
                 matrices[name] = matrix
+            missing_by_model = self._find_missing_songs(model_feats, files)
         except Exception as e:
             if app:
                 app.restoreOverrideCursor()
@@ -1230,13 +1315,13 @@ class MainWin(QMainWindow):
             return
         if app:
             app.restoreOverrideCursor()
-
         matrix = matrices[models[0]]
         features = features_by_model[models[0]]
         oc_features = features_by_model.get(models[1]) if len(models) > 1 else None
         plc_features = features_by_model.get(models[2]) if len(models) > 2 else None
         self._model_features = model_feats
         self._model_names = models
+        self._show_processing_summary(base_empty_removed, missing_by_model)        
         df = pd.DataFrame(matrix.astype(int), columns=[f"edge_{i}" for i in range(matrix.shape[1])])
 
         if self.model:
@@ -1401,6 +1486,8 @@ class MainWin(QMainWindow):
         app = QApplication.instance()
         if app:
             app.setOverrideCursor(Qt.WaitCursor)
+        base_empty_removed = 0
+        missing_by_model: dict[str, list[str]] = {}            
         try:
             features = self.model.features
             oc_feats = (
@@ -1421,11 +1508,7 @@ class MainWin(QMainWindow):
             empty_cols = np.where(matrix.sum(axis=0) == 0)[0]
             if len(empty_cols) > 0:
                 matrix = np.delete(matrix, empty_cols, axis=1)
-                QMessageBox.information(
-                    self,
-                    "Empty Hyperedges Removed",
-                    f"{len(empty_cols)} empty hyperedges were removed after clustering.",
-                )
+                base_empty_removed = len(empty_cols)
             if oc_matrix is not None:
                 oc_empty = np.where(oc_matrix.sum(axis=0) == 0)[0]
                 if len(oc_empty) > 0:
@@ -1434,14 +1517,18 @@ class MainWin(QMainWindow):
                 plc_empty = np.where(plc_matrix.sum(axis=0) == 0)[0]
                 if len(plc_empty) > 0:
                     plc_matrix = np.delete(plc_matrix, plc_empty, axis=1)
+            missing_by_model = self._find_missing_songs(
+                self._model_features or {}, self.model.im_list
+            )
         except Exception as e:
             if app:
                 app.restoreOverrideCursor()
+                
             QMessageBox.critical(self, "Reconstruction Error", str(e))
             return False
         if app:
             app.restoreOverrideCursor()
-
+        self._show_processing_summary(base_empty_removed, missing_by_model)
         df_parts: list[pd.DataFrame] = []
         edge_origins: list[str] = []
 

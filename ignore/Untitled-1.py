@@ -366,4 +366,249 @@ for model_name, df in per_model_stats.items():
 
 summary_df = pd.DataFrame(summary_rows)
 print(summary_df)
+
+
+
+
+
+
+
+
+
+# %%
+AUDIO_DIR = r"D:\Muziek\Youtube\tets"   # <- change me
+RECURSIVE = True                            # include subfolders
+SEGMENT_SECONDS = 30
+HOP_SECONDS = 15                          # None -> default hop = SEGMENT_SECONDS/2
+COMBINE = "separate"                        # "separate" (per-model rows) or "concat" (all models in one vector)
+DEVICE = None                               # None -> auto; or "cpu" / "cuda"
+SAVE_PREFIX = None                          # e.g., "/path/to/output/run1" to save .npy/.csv
+
+# --- Imports & setup ---
+from pathlib import Path
+import sys, warnings
+import numpy as np
+import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity as _cos
+
+# If audio_features.py is in the same folder as the notebook, this is enough.
+# If it's elsewhere, add that folder to sys.path:
+AF_PATH = Path("utils/feature_extraction.py").resolve()
+if not AF_PATH.exists():
+    raise FileNotFoundError("Could not find audio_features.py next to this notebook. "
+                            "Set AF_PATH below to its location.")
+sys.path.insert(0, str(AF_PATH.parent))
+
+# Import your module
+import utils.feature_extraction as af
+#%%
+# --- Collect audio files ---
+exts = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".aif", ".aiff"}
+root = Path(AUDIO_DIR).expanduser().resolve()
+if not root.exists():
+    raise FileNotFoundError(f"Audio folder not found: {root}")
+
+if RECURSIVE:
+    files = [str(p) for p in root.rglob("*") if p.suffix.lower() in exts]
+else:
+    files = [str(p) for p in root.iterdir() if p.is_file() and p.suffix.lower() in exts]
+if not files:
+    raise RuntimeError(f"No audio files in {root} with extensions: {sorted(exts)}")
+
+print(f"Found {len(files)} audio files.")
+#%%
+import torch
+DEVICE = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+print(DEVICE)
+#%%
+# --- Build models ---
+warnings.filterwarnings("default")
+extractors = af.build_windows_extractors(
+    segment_seconds=SEGMENT_SECONDS,
+    hop_seconds=HOP_SECONDS,
+    target_sr=48_000,
+    device=DEVICE,
+)
+print("Enabled models:")
+for e in extractors:
+    e.normalize = False
+extractors[3].target_sr = 16000
+for e in extractors:
+    print(f"  - {e.model_name} (target_sr={e.target_sr}, device={e.device})")
+
+multi = af.MultiModelAudioExtractor(
+    extractors=extractors,
+    combine=COMBINE,
+    segment_seconds=SEGMENT_SECONDS,
+    hop_seconds=HOP_SECONDS,
+    ref_sr=48_000,
+    normalize=False,
+)
+
+#%%
+# --- Run extraction ---
+if COMBINE == "concat":
+    # Single matrix; rows contain concatenated vectors across models
+    X, rows, songs = multi.extract_segments_and_songs(files)
+    rows_df = pd.DataFrame(rows)
+    songs_df = pd.DataFrame([{
+        "file": s.file, "model": s.model,
+        "centroid_dim": int(s.centroid_D.shape[0]),
+        "stats_dim": int(s.stats_2D.shape[0]),
+        "centroid_D": s.centroid_D.tolist(),
+        "stats_2D": s.stats_2D.tolist(),
+    } for s in songs])
+
+    print(f"\nSegments: {X.shape[0]} rows, dim={X.shape[1] if X.size else 0}")
+    display(rows_df.head())
+    display(songs_df.head())
+
+    if SAVE_PREFIX:
+        pref = Path(SAVE_PREFIX)
+        pref.parent.mkdir(parents=True, exist_ok=True)
+        np.save(pref.with_suffix(".segments.npy"), X)
+        rows_df.to_csv(pref.with_suffix(".segments_meta.csv"), index=False)
+        np.save(pref.with_suffix(".songs_centroid.npy"),
+                np.vstack([np.array(s.centroid_D, dtype=np.float32) for s in songs]) if songs else np.zeros((0,0), np.float32))
+        np.save(pref.with_suffix(".songs_stats.npy"),
+                np.vstack([np.array(s.stats_2D, dtype=np.float32) for s in songs]) if songs else np.zeros((0,0), np.float32))
+        songs_df.drop(columns=["centroid_D","stats_2D"]).to_csv(pref.with_suffix(".songs_meta.csv"), index=False)
+        print(f"Saved to prefix: {pref}")
+
+else:
+    # "separate": keep each model’s array separately (no forced vstack)
+    arrays = multi.extract_feature_arrays(files)  # tuple aligned with extractors
+    # Build per-model DataFrames of segment metadata (file/start/end/model/dim)
+    # by re-running lightweight metadata pass to match segment counts; reuse the same segmentation logic
+    # We can get metadata via extract_features_with_metadata with combine="concat" per-model simulation
+    # but simpler: rebuild rows by running once and discarding vectors.
+    # Here, we reconstruct rows per model using the same internal path as MultiModelAudioExtractor:
+    # Easiest: call extract_features_with_metadata with combine="concat" on a one-extractor runner per model.
+
+    per_model = []
+    for ext, X_i in zip(extractors, arrays):
+        single = af.MultiModelAudioExtractor([ext], combine="concat",
+                                             segment_seconds=SEGMENT_SECONDS,
+                                             hop_seconds=HOP_SECONDS,
+                                             ref_sr=48_000)
+        _, rows_i = single.extract_features_with_metadata(files)
+        rows_df_i = pd.DataFrame(rows_i)
+        assert len(rows_df_i) == len(X_i), (
+            f"Row/vector count mismatch for {ext.model_name}: "
+            f"{len(rows_df_i)} rows vs {len(X_i)} vecs"
+        )
+        per_model.append((ext.model_name, X_i, rows_df_i))
+
+    # Show a compact summary and first few rows for each model
+    for name, X_i, rows_df_i in per_model:
+        print(f"\nModel: {name} -> segments: {X_i.shape[0]}, dim: {X_i.shape[1] if X_i.size else 0}")
+
+    # Optional save
+    if SAVE_PREFIX:
+        pref = Path(SAVE_PREFIX)
+        pref.parent.mkdir(parents=True, exist_ok=True)
+        for name, X_i, rows_df_i in per_model:
+            safe = name.replace("/", "_").replace(" ", "_")
+            np.save(pref.with_name(pref.name + f".{safe}.segments.npy"), X_i)
+            rows_df_i.to_csv(pref.with_name(pref.name + f".{safe}.segments_meta.csv"), index=False)
+        print(f"\nSaved per-model outputs with prefix: {pref}")
+# %%
+import matplotlib.pyplot as plt
+
+model_id = 3
+cors = _cos([per_model[model_id][1][2],per_model[model_id][1][28]])
+print(cors)
+cosses_pos = []
+cosses_neg = []
+unq = per_model[model_id][2]['file'].unique()
+
+per_song_cors = []
+for item in unq:
+    per_song_cors.append([])
+
+for ind, seg in enumerate(per_model[model_id][1]):
+    for indx, segx in enumerate(per_model[model_id][1]):
+        cors = _cos([seg,segx])
+        
+        per_song_cors[np.where(unq==per_model[model_id][2].iloc[30]['file'])[0][0]].append(cors[1,0])
+        if per_model[model_id][2].iloc[ind]['file'] == per_model[model_id][2].iloc[indx]['file']:
+            if indx != ind:
+                cosses_pos.append(cors[1,0])
+        else:
+            cosses_neg.append(cors[1,0])
+
+#%%
+
+per_song_cors_arr = np.array([per_song_cors])
+#%%
+plt.plot(cosses_neg)
+plt.plot(cosses_pos)
+print('pos:',np.mean(cosses_pos),'neg:',np.mean(cosses_neg))
+# %%
+# Build ROC/PR from your lists of cosine similarities
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
+
+# Assuming you already have:
+# cosses_pos: list[float]  # same-song pairs (excluding self-pairs)
+# cosses_neg: list[float]  # different-song pairs
+
+# 1) Prepare labels and scores
+y_true = np.concatenate([np.ones(len(cosses_pos), dtype=int), np.zeros(len(cosses_neg), dtype=int)])
+scores = np.concatenate([np.array(cosses_pos, dtype=float), np.array(cosses_neg, dtype=float)])
+
+# 2) ROC
+fpr, tpr, roc_thresholds = roc_curve(y_true, scores)      # scores: larger => positive
+roc_auc = auc(fpr, tpr)
+
+# Youden J to pick a threshold (maximizes TPR - FPR)
+youden_idx = np.argmax(tpr - fpr)
+thr_best = roc_thresholds[youden_idx]
+tpr_best, fpr_best = tpr[youden_idx], fpr[youden_idx]
+
+# 3) Precision–Recall (useful with class imbalance)
+prec, rec, pr_thresholds = precision_recall_curve(y_true, scores)
+ap = average_precision_score(y_true, scores)
+
+# 4) Quick summaries
+print(f"ROC AUC: {roc_auc:.4f}")
+print(f"PR  AP : {ap:.4f}")
+print(f"Best threshold (Youden J): {thr_best:.4f} -> TPR={tpr_best:.3f}, FPR={fpr_best:.3f}")
+print(f"Means  pos={np.mean(cosses_pos):.4f}, neg={np.mean(cosses_neg):.4f}")
+
+# 5) Plots (no seaborn, single-plot each)
+plt.figure()
+plt.plot(fpr, tpr, label=f"ROC (AUC={roc_auc:.3f})")
+plt.plot([0,1], [0,1], linestyle="--")
+plt.scatter([fpr_best], [tpr_best], label=f"Best thr={thr_best:.3f}", zorder=3)
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC – same-song vs different-song")
+plt.legend()
+plt.show()
+
+plt.figure()
+plt.plot(rec, prec, label=f"PR (AP={ap:.3f})")
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("Precision–Recall – same-song vs different-song")
+plt.legend()
+plt.show()
+
+# (Optional) quick overlap check
+# Histograms to visualize similarity overlap
+plt.figure()
+plt.hist(cosses_neg, bins=50, alpha=0.6, label="neg (diff song)", density=True)
+plt.hist(cosses_pos, bins=50, alpha=0.6, label="pos (same song)", density=True)
+plt.axvline(thr_best, linestyle="--", label=f"Best thr={thr_best:.3f}")
+plt.xlabel("Cosine similarity")
+plt.ylabel("Density")
+plt.title("Similarity distributions")
+plt.legend()
+plt.show()
+
 # %%

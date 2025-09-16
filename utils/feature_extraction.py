@@ -12,7 +12,7 @@ import torch
 import librosa
 import soundfile as sf
 import warnings
-
+import tensorflow
 # ----------------------------
 # Model cache dir
 # ----------------------------
@@ -93,7 +93,7 @@ def _l2_normalize(v: np.ndarray) -> np.ndarray:
     return v.astype(np.float32)
 
 
-def _compute_song_embeddings(X: np.ndarray, rows: List[Dict[str, Any]]) -> List[SongEmbedding]:
+def _compute_song_embeddings(X: np.ndarray, rows: List[Dict[str, Any]], normalize: bool = True) -> List[SongEmbedding]:
     """Aggregate segment vectors into song-level embeddings."""
     grouped: Dict[Tuple[str, str], List[int]] = defaultdict(list)
     for idx, r in enumerate(rows):
@@ -112,12 +112,15 @@ def _compute_song_embeddings(X: np.ndarray, rows: List[Dict[str, Any]]) -> List[
             stats = np.zeros(2 * D, dtype=np.float32)
         else:
             mean = (V * weights).sum(axis=0) / w_sum
-            centroid = _l2_normalize(mean)
-            var = ((V - mean) ** 2 * weights).sum(axis=0) / w_sum
-            std = np.sqrt(np.maximum(var, 1e-8))
-            stats_vec = np.concatenate([mean, std], axis=0)
-            stats = _l2_normalize(stats_vec)
-
+            if normalize:
+                centroid = _l2_normalize(mean)
+                var = ((V - mean) ** 2 * weights).sum(axis=0) / w_sum
+                std = np.sqrt(np.maximum(var, 1e-8))
+                stats_vec = np.concatenate([mean, std], axis=0)
+                stats = _l2_normalize(stats_vec)
+            else:
+                centroid = mean.astype(np.float32)
+                stats = stats_vec.astype(np.float32)
         songs.append(
             SongEmbedding(
                 file=file,
@@ -139,6 +142,7 @@ class AudioFeatureExtractorBase:
         hop_seconds: Optional[float] = None,
         target_sr: int = 48000,
         device: Optional[str] = None,
+        normalize: bool = True,   # <-- NEW
     ):
         self.segment_seconds = float(segment_seconds)
         self.hop_seconds = hop_seconds
@@ -146,6 +150,7 @@ class AudioFeatureExtractorBase:
         self.device = torch.device(device) if device else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+        self.normalize = normalize
         self._init_model()
 
     # to be implemented by subclasses
@@ -209,7 +214,8 @@ class AudioFeatureExtractorBase:
                 v = np.asarray(v, dtype=np.float32)
                 if v.ndim != 1:
                     v = v.reshape(-1)  # force 1D
-                v = _l2_normalize(v)                    
+                if self.normalize:
+                    v = _l2_normalize(v)        
                 vecs.append(v)
                 rows.append({"file": f, "start_s": s, "end_s": e,
                             "model": self.model_name, "dim": int(v.shape[-1])})
@@ -225,17 +231,64 @@ class AudioFeatureExtractorBase:
     ) -> Tuple[np.ndarray, List[Dict[str, Any]], List[SongEmbedding]]:
         """Return segment embeddings with metadata and pooled song-level vectors."""
         X, rows = self.extract_features_with_metadata(file_list)
-        songs = _compute_song_embeddings(X, rows)
+        songs = _compute_song_embeddings(X, rows, normalize=self.normalize)
         return X, rows, songs
 
 # ----------------------------
 # OpenL3
 # ----------------------------
 
+# class OpenL3FeatureExtractor(AudioFeatureExtractorBase):
+#     """
+#     Optional: requires openl3 (works well on Python 3.11).
+#     pip install openl3
+#     """
+
+#     def __init__(
+#         self,
+#         input_repr: str = "mel256",
+#         content_type: str = "music",
+#         embedding_size: int = 512,
+#         center: bool = False,
+#         hop_size: float = 0.5,
+#         **kwargs,
+#     ):
+#         self.input_repr = input_repr
+#         self.content_type = content_type
+#         self.embedding_size = int(embedding_size)
+#         self.center = center
+#         self.hop_size = float(hop_size)
+#         super().__init__(**kwargs)
+
+#     def _init_model(self) -> None:
+#         try:
+#             import openl3  # lazy import
+#             self._openl3 = openl3
+#             self.model_name = f"openl3_{self.content_type}_{self.input_repr}_{self.embedding_size}"
+#         except Exception as e:
+#             raise ImportError(
+#                 "OpenL3 not available. Install with `pip install openl3` (Python 3.11 recommended)."
+#             ) from e
+
+#     def _embed_waveform(self, y: np.ndarray, sr: int) -> np.ndarray:
+#         emb, _ = self._openl3.get_audio_embedding(
+#             y,
+#             sr,
+#             input_repr=self.input_repr,
+#             content_type=self.content_type,
+#             embedding_size=self.embedding_size,
+#             center=self.center,
+#             hop_size=self.hop_size,
+#         )
+#         return np.asarray(emb.mean(axis=0), dtype=np.float32, order="C")
+
+#     def output_dim(self) -> int:
+#         return int(self.embedding_size)
+
 class OpenL3FeatureExtractor(AudioFeatureExtractorBase):
     """
     Optional: requires openl3 (works well on Python 3.11).
-    pip install openl3
+    pip install openl3 tensorflow
     """
 
     def __init__(
@@ -245,6 +298,8 @@ class OpenL3FeatureExtractor(AudioFeatureExtractorBase):
         embedding_size: int = 512,
         center: bool = False,
         hop_size: float = 0.5,
+        # NEW:
+        layer: str | int | None = None,   # None -> default embedding output
         **kwargs,
     ):
         self.input_repr = input_repr
@@ -252,32 +307,80 @@ class OpenL3FeatureExtractor(AudioFeatureExtractorBase):
         self.embedding_size = int(embedding_size)
         self.center = center
         self.hop_size = float(hop_size)
+        self.layer_spec = layer
         super().__init__(**kwargs)
 
     def _init_model(self) -> None:
-        try:
-            import openl3  # lazy import
-            self._openl3 = openl3
-            self.model_name = f"openl3_{self.content_type}_{self.input_repr}_{self.embedding_size}"
-        except Exception as e:
-            raise ImportError(
-                "OpenL3 not available. Install with `pip install openl3` (Python 3.11 recommended)."
-            ) from e
+        import tensorflow as tf
+        import openl3
 
-    def _embed_waveform(self, y: np.ndarray, sr: int) -> np.ndarray:
-        emb, _ = self._openl3.get_audio_embedding(
-            y,
-            sr,
+        self._openl3 = openl3
+        # Load the standard OpenL3 embedding model
+        base = openl3.models.load_audio_embedding_model(
             input_repr=self.input_repr,
             content_type=self.content_type,
             embedding_size=self.embedding_size,
+        )
+
+        # Pick layer
+        out_tensor = base.output
+        layer_name = "embedding"  # nice default label
+
+        if self.layer_spec is not None:
+            if isinstance(self.layer_spec, int):
+                chosen = base.layers[self.layer_spec]
+                out_tensor = chosen.output
+                layer_name = chosen.name
+            elif isinstance(self.layer_spec, str):
+                # convenience aliases
+                if self.layer_spec.lower() in {"embedding", "final", "last"}:
+                    out_tensor = base.output
+                    layer_name = "embedding"
+                elif self.layer_spec.lower() in {"penultimate", "prelogits", "before_dense"}:
+                    # common case: second-to-last layer
+                    chosen = base.layers[-2]
+                    out_tensor = chosen.output
+                    layer_name = chosen.name
+                else:
+                    chosen = base.get_layer(self.layer_spec)
+                    out_tensor = chosen.output
+                    layer_name = chosen.name
+            else:
+                raise ValueError("layer must be None, int (index), or str (name)")
+
+            # If this is a feature map, pool spatial/time dims so we return a vector per frame
+            rank = len(out_tensor.shape)
+            if rank == 4:
+                out_tensor = tf.keras.layers.GlobalAveragePooling2D(name="l3_gap2d")(out_tensor)
+            elif rank == 3:
+                out_tensor = tf.keras.layers.GlobalAveragePooling1D(name="l3_gap1d")(out_tensor)
+            elif rank == 2:
+                pass  # already (batch, D)
+            else:
+                raise RuntimeError(f"Unexpected tensor rank {rank} for layer '{layer_name}'")
+
+        # Build the submodel we’ll hand to openl3.get_audio_embedding
+        from tensorflow.keras import Model
+        self.submodel = Model(inputs=base.input, outputs=out_tensor, name=f"openl3_sub_{layer_name}")
+        self._output_dim = int(self.submodel.output_shape[-1])
+
+        self.model_name = f"openl3_{self.content_type}_{self.input_repr}_{self.embedding_size}" \
+                          + (f"@{layer_name}" if self.layer_spec is not None else "")
+
+    def _embed_waveform(self, y: np.ndarray, sr: int) -> np.ndarray:
+        # Use openl3’s framing, but with our submodel to fetch the desired layer
+        emb, _ts = self._openl3.get_audio_embedding(
+            y,
+            sr,
+            model=self.submodel,  # <-- custom layer output
             center=self.center,
             hop_size=self.hop_size,
         )
+        # mean over frames -> one vector for the segment
         return np.asarray(emb.mean(axis=0), dtype=np.float32, order="C")
 
     def output_dim(self) -> int:
-        return int(self.embedding_size)
+        return self._output_dim
 
 
 # ----------------------------
@@ -365,6 +468,70 @@ class MERTFeatureExtractor(AudioFeatureExtractorBase):
             # Fallback for known variant
             return 768  # 95M variant
 
+###############################################################
+########## HFAudioClassifierFeatureExtractor ###########
+############################################################
+class HFAudioClassifierFeatureExtractor(AudioFeatureExtractorBase):
+    """
+    Wrap an HF audio classification checkpoint (e.g., Wav2Vec2/AST) and expose
+    hidden-state embeddings with simple time pooling.
+    Examples:
+      - "dima806/music_genres_classification" (Wav2Vec2 genre; 16 kHz)
+      - "MIT/ast-finetuned-audioset-10-10-0.4593" (AST; feature extractor handles spectrogram)
+    """
+
+    def __init__(
+        self,
+        hf_model: str,
+        layer: int = -1,                 # which hidden layer to use; -1 = last
+        target_sr: Optional[int] = None, # if None, inferred from feature extractor (for Wav2Vec2 often 16000)
+        **kwargs,
+    ):
+        self.hf_model = hf_model
+        self.layer = layer
+        self._explicit_sr = target_sr
+        super().__init__(**kwargs)
+
+    def _init_model(self) -> None:
+        from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
+        self.model_name = f"hf_audio_cls_{Path(self.hf_model).name}"
+        # Feature extractor prepares raw waveforms / spectrograms per checkpoint
+        self.processor = AutoFeatureExtractor.from_pretrained(self.hf_model)
+        self.model = AutoModelForAudioClassification.from_pretrained(self.hf_model).to(self.device).eval()
+
+        # Decide sampling rate
+        sr = self._explicit_sr
+        if sr is None:
+            # Most HF audio feature extractors expose a sampling_rate field
+            sr = getattr(self.processor, "sampling_rate", None)
+        if sr is None:
+            # Fallback defaults: Wav2Vec2 commonly 16k; AST uses its own featurization but 16k works
+            sr = 48_000
+        self.target_sr = int(sr)
+
+    def _embed_waveform(self, y: np.ndarray, sr: int) -> np.ndarray:
+        # Standard HF audio path: processor returns inputs for model
+        inputs = self.processor(y, sampling_rate=sr, return_tensors="pt")
+        inputs = {k: (v.to(self.device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
+        with torch.no_grad():
+            out = self.model(**inputs, output_hidden_states=True)
+        # Pick a hidden layer (shape: [B, T, D] or sometimes [B, D])
+        hs = out.hidden_states[self.layer] if hasattr(out, "hidden_states") and out.hidden_states is not None else out.logits
+        if hs.dim() == 3:
+            pooled = hs.mean(dim=1)     # [B, D]
+        elif hs.dim() == 2:
+            pooled = hs                  # already [B, D]
+        else:
+            raise RuntimeError(f"Unexpected hidden_states shape: {tuple(hs.shape)}")
+        return pooled.squeeze(0).float().cpu().numpy()
+
+    def output_dim(self) -> int:
+        try:
+            return int(getattr(self.model.config, "hidden_size"))
+        except Exception:
+            # Fall back to classifier head width if needed
+            return int(self.model.classifier.in_features)  # type: ignore[attr-defined]
+
 
 # ----------------------------
 # Multi-model wrapper
@@ -384,6 +551,7 @@ class MultiModelAudioExtractor:
         segment_seconds: float = 30.0,
         hop_seconds: Optional[float] = None,
         ref_sr: int = 48000,
+        normalize: bool = True,   
     ):
         assert combine in ("concat", "separate")
         if not extractors:
@@ -393,6 +561,7 @@ class MultiModelAudioExtractor:
         self.segment_seconds = float(segment_seconds)
         self.hop_seconds = hop_seconds if hop_seconds is not None else float(segment_seconds) / 2.0
         self.ref_sr = int(ref_sr)
+        self.normalize = normalize
 
     def extract_features_with_metadata(self, file_list: List[str]) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         all_rows: List[Dict[str, Any]] = []
@@ -442,8 +611,8 @@ class MultiModelAudioExtractor:
                     v = np.asarray(v, dtype=np.float32)
                     if v.ndim != 1:
                         v = v.reshape(-1)
-                    v = _l2_normalize(v)                        
-
+                    if self.normalize:
+                        v = _l2_normalize(v)
                     if self.combine == "concat":
                         parts.append(v)  # type: ignore
                     else:
@@ -455,7 +624,8 @@ class MultiModelAudioExtractor:
                     if parts is None or len(parts) != len(self.extractors):
                         continue  # a sub-embed failed/was empty
                     vcat = np.concatenate(parts, axis=0)
-                    vcat = _l2_normalize(vcat)                    
+                    if self.normalize:
+                        vcat = _l2_normalize(vcat)
                     all_vecs.append(vcat)
                     model_tag = "+".join(ext.model_name for ext in self.extractors)
                     all_rows.append({"file": f, "start_s": s, "end_s": e,
@@ -476,7 +646,7 @@ class MultiModelAudioExtractor:
     def extract_segments_and_songs(self, file_list: List[str]) -> Tuple[np.ndarray, List[Dict[str, Any]], List[SongEmbedding]]:
         """Return segment embeddings with metadata and pooled song-level vectors."""
         X, rows = self.extract_features_with_metadata(file_list)
-        songs = _compute_song_embeddings(X, rows)
+        songs = _compute_song_embeddings(X, rows, normalize=self.normalize)
         return X, rows, songs
 
 
@@ -547,32 +717,59 @@ def build_windows_extractors(
     hop_seconds: float | None = None,
     target_sr: int = 48_000,
     device: str | None = None,
+    hf_genre_ckpt: str = "dima806/music_genres_classification",  # unused here; keep/remove as you like
+    hf_genre_layer: int = -1,                                     # unused here
 ):
     exts: List[AudioFeatureExtractorBase] = []
 
-    # Try OpenL3 (optional)
+    # OpenL3 (final embedding layer)
     try:
-        exts.append(OpenL3FeatureExtractor(segment_seconds=segment_seconds,
-                                           hop_seconds=hop_seconds,
-                                           target_sr=target_sr,
-                                           device=device or "cpu"))
+        exts.append(
+            OpenL3FeatureExtractor(
+                input_repr="mel256",
+                content_type="music",
+                embedding_size=512,
+                segment_seconds=segment_seconds,
+                hop_seconds=hop_seconds,
+                target_sr=target_sr,
+                device=device or "cpu",
+            )
+        )
     except ImportError as e:
         warnings.warn(str(e))
 
-    # CLAP (works fine on CPU too)
-    exts.append(CLAPFeatureExtractor(segment_seconds=segment_seconds,
-                                     hop_seconds=hop_seconds,
-                                     target_sr=target_sr,
-                                     device=device or "cpu"))
-
-    # MERT (may fail if nnAudio missing etc.) -> skip gracefully
+    # OpenL3 (penultimate layer)
     try:
-        exts.append(MERTFeatureExtractor(segment_seconds=segment_seconds,
-                                         hop_seconds=hop_seconds,
-                                         target_sr=target_sr,
-                                         device=device or "cpu"))
-    except Exception as e:
-        warnings.warn(f"Skipping MERT: {e}")
+        exts.append(
+            OpenL3FeatureExtractor(
+                input_repr="mel256",
+                content_type="music",
+                embedding_size=512,
+                layer=-3,               # <-- key difference
+                segment_seconds=segment_seconds,
+                hop_seconds=hop_seconds,
+                target_sr=target_sr,
+                device=device or "cpu",
+            )
+        )
+    except ImportError as e:
+        warnings.warn(str(e))
+
+    try:
+        exts.append(
+            OpenL3FeatureExtractor(
+                input_repr="mel256",
+                content_type="music",
+                embedding_size=512,
+                layer=-4,               # <-- key difference
+                segment_seconds=segment_seconds,
+                hop_seconds=hop_seconds,
+                target_sr=target_sr,
+                device=device or "cpu",
+            )
+        )
+    except ImportError as e:
+        warnings.warn(str(e))
 
     return exts
 
