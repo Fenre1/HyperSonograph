@@ -567,6 +567,7 @@ class MainWin(QMainWindow):
             return
 
         self._apply_similarity_results(sim_map, ref_name)
+        self._show_similarity_in_audio_table(ref_name, scores)
 
     def compute_song_level_similarity(self) -> None:
         if not self.model:
@@ -616,6 +617,7 @@ class MainWin(QMainWindow):
             return
 
         self._apply_similarity_results(sim_map, ref_name)
+        self._show_similarity_in_audio_table(ref_name, scores)
 
     def _scores_to_edge_map(self, scores: Mapping[int, float]) -> dict[str, float]:
         if not self.model:
@@ -641,6 +643,45 @@ class MainWin(QMainWindow):
         self._source_model().sort(SIM_COL, Qt.DescendingOrder)
         self._similarity_ref = ref_name
         self._similarity_computed = True
+
+
+    def _show_similarity_in_audio_table(
+        self,
+        ref_name: str,
+        scores: Mapping[int, float],
+    ) -> None:
+        if not (self.model and getattr(self, "audio_table", None)):
+            return
+
+        total = len(self.model.im_list)
+        rows: list[tuple[int, float]] = []
+        for raw_idx, raw_score in scores.items():
+            try:
+                song_idx = int(raw_idx)
+            except (TypeError, ValueError):
+                continue
+
+            if not (0 <= song_idx < total):
+                continue
+
+            if not self.model.song_edge_names.get(song_idx):
+                continue
+
+            try:
+                value = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+
+            if not math.isfinite(value):
+                continue
+
+            rows.append((song_idx, value))
+
+        if not rows:
+            return
+
+        rows.sort(key=lambda item: item[1], reverse=True)
+        self.audio_table.show_similarity_results(ref_name, rows, self.model)
 
     def _update_similarity_buttons_state(self) -> None:
         has_model = self.model is not None
