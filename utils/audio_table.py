@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import List, Sequence
 
 from PyQt5.QtCore import Qt, QSortFilterProxyModel, pyqtSignal as Signal
 from PyQt5.QtGui import QStandardItem, QStandardItemModel
@@ -47,6 +47,7 @@ class _AudioTable(QWidget):
         self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.view.horizontalHeader().setStretchLastSection(True)
+        self.view.setSortingEnabled(True)        
         layout.addWidget(self.view)
 
         self.filter_edit.textChanged.connect(self.proxy.setFilterFixedString)
@@ -65,6 +66,19 @@ class _AudioTable(QWidget):
                 ]
                 self.model.appendRow(items)
 
+    def set_similarity(self, pairs: Sequence[tuple[int, float]]) -> None:
+        """Populate the table with indices and similarity scores."""
+        self.model.setRowCount(0)
+        paths = self._session.im_list
+        for idx, score in pairs:
+            if 0 <= idx < len(paths):
+                path = paths[idx]
+                name_item = QStandardItem(Path(path).name)
+                path_item = QStandardItem(path)
+                sim_item = QStandardItem(f"{score:.3f}")
+                sim_item.setData(float(score), Qt.EditRole)
+                self.model.appendRow([name_item, path_item, sim_item])
+        self.view.sortByColumn(2, Qt.DescendingOrder)
 
 class AudioTableDock(QDockWidget):
     """Dock widget containing filterable tables of audio files for each model."""
@@ -110,6 +124,44 @@ class AudioTableDock(QDockWidget):
         # show all files initially
         table.set_indices(list(range(len(session.im_list))))
         self.tabs.setCurrentWidget(table)
+
+    def show_similarity_results(
+        self,
+        ref_name: str,
+        results: Sequence[tuple[int, float]],
+        session: SessionModel,
+    ) -> None:
+        """Add or update a tab containing similarity-ranked songs."""
+        tab_title = f"Similarity – {ref_name}"
+        table: _AudioTable | None = None
+
+        for idx in range(self.tabs.count()):
+            if self.tabs.tabText(idx) == tab_title:
+                widget = self.tabs.widget(idx)
+                if isinstance(widget, _AudioTable):
+                    table = widget
+                else:
+                    table = _AudioTable(session, self)
+                    self.tabs.removeTab(idx)
+                    self.tabs.insertTab(idx, table, tab_title)
+                break
+
+        if table is None:
+            table = _AudioTable(session, self)
+            self.tabs.addTab(table, tab_title)
+
+        table.set_similarity(results)
+        self._sessions[tab_title] = session
+        self.tabs.setCurrentWidget(table)
+
+        idxs = [idx for idx, _ in results]
+        if idxs:
+            self._history = [idxs]
+            self._hist_pos = 0
+        else:
+            self._history = []
+            self._hist_pos = -1
+        self.historyChanged.emit()
 
     def clear(self) -> None:
         self.tabs.clear()

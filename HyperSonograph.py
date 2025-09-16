@@ -8,6 +8,7 @@ import io
 import torch
 import logging
 import time
+import math
 import pyqtgraph as pg
 from PyQt5.QtWidgets import (
     QApplication,
@@ -479,6 +480,33 @@ class MainWin(QMainWindow):
         self._source_model().sort(SIM_COL, Qt.DescendingOrder)
         self._similarity_ref = ref_name
         self._similarity_computed = True
+
+        if self.model and getattr(self, "audio_table", None):
+            similarity_rows: list[tuple[int, float]] = []
+            for name, score in sim_map.items():
+                song_idx = self.model.edge_to_song_index.get(name)
+                if song_idx is None:
+                    continue
+
+                if isinstance(score, (int, float)):
+                    value = float(score)
+                elif isinstance(score, (np.floating, np.integer)):
+                    value = float(score)
+                else:
+                    continue
+
+                if not math.isfinite(value):
+                    continue
+
+                similarity_rows.append((song_idx, value))
+
+            if similarity_rows:
+                similarity_rows.sort(key=lambda item: item[1], reverse=True)
+                self.audio_table.show_similarity_results(
+                    ref_name,
+                    similarity_rows,
+                    self.model,
+                )
 
     def compute_single_segment_similarity(self) -> None:
         self._compute_segment_similarity(average=False)
