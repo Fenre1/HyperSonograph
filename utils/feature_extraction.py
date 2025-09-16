@@ -708,74 +708,51 @@ class MultiModelAudioExtractor:
 
         return tuple(arrays)
 
+
+def create_default_openl3_extractor(
+    *,
+    segment_seconds: float = 30.0,
+    hop_seconds: float | None = None,
+    target_sr: int = 48_000,
+    device: str | None = None,
+) -> OpenL3FeatureExtractor:
+    """Return the configured OpenL3 extractor used throughout the app."""
+
+    return OpenL3FeatureExtractor(
+        input_repr="mel256",
+        content_type="music",
+        embedding_size=512,
+        layer=-4,
+        segment_seconds=segment_seconds,
+        hop_seconds=hop_seconds,
+        target_sr=target_sr,
+        device=device or "cpu",
+    )
 # ----------------------------
 # Factory: build available models (OpenL3 optional)
 # ----------------------------
+
 
 def build_windows_extractors(
     segment_seconds: float = 30.0,
     hop_seconds: float | None = None,
     target_sr: int = 48_000,
     device: str | None = None,
-    hf_genre_ckpt: str = "dima806/music_genres_classification",  # unused here; keep/remove as you like
-    hf_genre_layer: int = -1,                                     # unused here
+    **_: Any,
 ):
+    """Compatibility helper returning the single supported extractor."""
+
     exts: List[AudioFeatureExtractorBase] = []
-
-    # OpenL3 (final embedding layer)
     try:
         exts.append(
-            OpenL3FeatureExtractor(
-                input_repr="mel256",
-                content_type="music",
-                embedding_size=512,
+            create_default_openl3_extractor(
                 segment_seconds=segment_seconds,
                 hop_seconds=hop_seconds,
                 target_sr=target_sr,
-                device=device or "cpu",
+                device=device,
             )
         )
     except ImportError as e:
         warnings.warn(str(e))
-
-    # OpenL3 (penultimate layer)
-    try:
-        exts.append(
-            OpenL3FeatureExtractor(
-                input_repr="mel256",
-                content_type="music",
-                embedding_size=512,
-                layer=-3,               # <-- key difference
-                segment_seconds=segment_seconds,
-                hop_seconds=hop_seconds,
-                target_sr=target_sr,
-                device=device or "cpu",
-            )
-        )
-    except ImportError as e:
-        warnings.warn(str(e))
-
-    try:
-        exts.append(
-            OpenL3FeatureExtractor(
-                input_repr="mel256",
-                content_type="music",
-                embedding_size=512,
-                layer=-4,               # <-- key difference
-                segment_seconds=segment_seconds,
-                hop_seconds=hop_seconds,
-                target_sr=target_sr,
-                device=device or "cpu",
-            )
-        )
-    except ImportError as e:
-        warnings.warn(str(e))
-
     return exts
 
-# Usage example:
-# files = ["song1.mp3", "song2.flac"]
-# extractors = build_windows_extractors(segment_seconds=30.0, hop_seconds=15.0)
-# multi = MultiModelAudioExtractor(extractors, combine="separate", segment_seconds=30.0, hop_seconds=15.0)
-# vecs, meta = multi.extract_features_with_metadata(files)
-# %%

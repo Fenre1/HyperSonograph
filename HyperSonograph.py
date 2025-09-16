@@ -61,18 +61,13 @@ from utils.audio_table import AudioTableDock
 from utils.audio_schema import SegmentLevel, SongLevel, ModelFeatures
 
 from utils.spatial_viewQv4 import SpatialViewQDock, HyperedgeItem
-from utils.feature_extraction import (
-    AudioFeatureExtractorBase,
-    CLAPFeatureExtractor,
-    MERTFeatureExtractor,
-    OpenL3FeatureExtractor,
-)
+from utils.feature_extraction import create_default_openl3_extractor
 from utils.file_utils import get_audio_files
 from utils.session_stats import show_session_stats
 from utils.metadata_overview import show_metadata_overview
 from utils.hyperedge_matrix2 import HyperedgeMatrixDock
 
-from clustering.temi_clustering import temi_cluster
+# from clustering.temi_clustering import temi_cluster
 
 import pyqtgraph as pg
 try:
@@ -177,94 +172,28 @@ class NewSessionDialog(QDialog):
         layout = QVBoxLayout(self)
         info = QLabel(
             f"Found {image_count} audio files.\n\n"
-            "Feature extraction and clustering will be performed to generate "
-            "the hypergraph. This may take a couple of minutes."
+            "Features will be extracted with OpenL3 (mel256/music/512, layer -4). "
+            "Adjust the segment settings if desired."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        layout.addWidget(QLabel("Number of hyperedges (20-200 recommended):"))
-        self.edge_edit = QLineEdit("50")
-        layout.addWidget(self.edge_edit)
+        layout.addWidget(QLabel("Segment length (seconds):"))
+        self.segment_edit = QLineEdit("30.0")
+        layout.addWidget(self.segment_edit)
 
-        layout.addWidget(QLabel("Threshold for hypergraph generation:"))
-        self.thr_edit = QLineEdit("0.5")
-        layout.addWidget(self.thr_edit)
-        thr_info = QLabel(
-            "You can change this threshold later. Adjusting it is fast."
-        )
-        thr_info.setWordWrap(True)
-        layout.addWidget(thr_info)
-
-        layout.addWidget(QLabel("Duplicate removal Jaccard threshold:"))
-        self.jacc_edit = QLineEdit(str(JACCARD_PRUNE_DEFAULT))
-        layout.addWidget(self.jacc_edit)
-
-        self.clap_cb = QCheckBox("Include CLAP model")
-        self.mert_cb = QCheckBox("Include MERT model")
-        self.openl3_cb = QCheckBox("Include OpenL3 model")
-        layout.addWidget(self.clap_cb)
-        layout.addWidget(self.mert_cb)
-        layout.addWidget(self.openl3_cb)
+        layout.addWidget(QLabel("Hop length (seconds):"))
+        self.hop_edit = QLineEdit("15.0")
+        layout.addWidget(self.hop_edit)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("Start generating hypergraph")
+        buttons.button(QDialogButtonBox.Ok).setText("Start feature extraction")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def parameters(self) -> tuple[int, float, float, list[str]]:
-        models: list[str] = []
-        if self.clap_cb.isChecked():
-            models.append("CLAP")
-        if self.mert_cb.isChecked():
-            models.append("MERT")
-        if self.openl3_cb.isChecked():
-            models.append("OpenL3")
-        return (
-            int(self.edge_edit.text()),
-            float(self.thr_edit.text()),
-            float(self.jacc_edit.text()),
-            models,
-        )
-
-class ReconstructDialog(QDialog):
-    """Dialog to set parameters for hypergraph reconstruction."""
-
-    def __init__(self, current_edges: int, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Reconstruct Hypergraph")
-
-        layout = QVBoxLayout(self)
-        info = QLabel(
-            "Recalculate the clustering using the existing features."
-        )
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        layout.addWidget(QLabel("Number of hyperedges:"))
-        self.edge_edit = QLineEdit(str(current_edges))
-        layout.addWidget(self.edge_edit)
-
-        layout.addWidget(QLabel("Threshold for hypergraph generation:"))
-        self.thr_edit = QLineEdit("0.5")
-        layout.addWidget(self.thr_edit)
-
-        layout.addWidget(QLabel("Duplicate removal Jaccard threshold:"))
-        self.jacc_edit = QLineEdit(str(JACCARD_PRUNE_DEFAULT))
-        layout.addWidget(self.jacc_edit)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def parameters(self) -> tuple[int, float, float]:
-        return (
-            int(self.edge_edit.text()),
-            float(self.thr_edit.text()),
-            float(self.jacc_edit.text()),
-        )
+    def parameters(self) -> tuple[float, float]:
+        return float(self.segment_edit.text()), float(self.hop_edit.text())
 
 
 
@@ -806,8 +735,6 @@ class MainWin(QMainWindow):
         save_act = QAction("&Save", self, triggered=self.save_session)
         save_as_act = QAction("Save &As…", self, triggered=self.save_session_as)
 
-        reconstruct_act = QAction("Reconstruct Hypergraph…", self,
-                                   triggered=self.reconstruct_hypergraph)
 
         self.thumb_toggle_act = QAction("Use Full Images", self, checkable=True)
         self.thumb_toggle_act.toggled.connect(self.toggle_full_images)
@@ -818,10 +745,9 @@ class MainWin(QMainWindow):
         file_menu.addAction(save_act)
         file_menu.addAction(save_as_act)
         file_menu.addAction(self.thumb_toggle_act)
-        file_menu.addAction(reconstruct_act)       
-        file_menu.addAction(reconstruct_act)
+
         import_folder_act = QAction("Import folder", self, triggered=self.import_folder)
-        file_menu.addAction(import_folder_act)         
+        file_menu.addAction(import_folder_act)
         # self.menuBar().addMenu("&File").addAction(open_act)
 
         self.model = None
@@ -854,225 +780,11 @@ class MainWin(QMainWindow):
             self.process_audio_files(files)
 
     def process_audio_files(self, files: list[str]) -> None:
-        """Import additional audio files into the current session.
-
-        This performs feature extraction at both the segment and song level for
-        all available models. The resulting :class:`ModelFeatures` objects are
-        appended to ``_model_features`` and the hypergraph is reconstructed so
-        that the UI reflects the newly added songs.
-        """
-        print(len(files))
-        if not self.model:
-            QMessageBox.warning(
-                self, "No Session", "Please load or create a session first."
-            )
-            return
-
-        extractors: list[AudioFeatureExtractorBase] = []
-        try:
-            extractors.append(CLAPFeatureExtractor())
-            'success clap'
-        except Exception:
-            pass
-        try:
-            extractors.append(MERTFeatureExtractor())
-            'success mert'
-        except Exception:
-            pass
-        try:
-            extractors.append(OpenL3FeatureExtractor())
-            'success openl3'
-        except Exception:
-            pass
-        if not extractors:
-            QMessageBox.warning(
-                self, "No Models", "No audio feature extractors available."
-            )
-            return
-
-        start_idx = len(self.model.im_list)
-        file_index = {f: start_idx + i for i, f in enumerate(files)}
-        print('stsd',start_idx)
-        missing_by_model: dict[str, list[str]] = {}
-        for ext in extractors:
-            Xseg, rows, songs = ext.extract_segments_and_songs(files)
-
-            seg_song_ids = np.array(
-                [file_index[r["file"]] for r in rows], dtype=np.int32
-            )
-            segs = SegmentLevel(
-                embeddings=Xseg,
-                song_id=seg_song_ids,
-                start_s=np.array([r["start_s"] for r in rows], dtype=np.float32),
-                end_s=np.array([r["end_s"] for r in rows], dtype=np.float32),
-            )
-            centroids = (
-                np.vstack([s.centroid_D for s in songs])
-                if songs
-                else np.zeros((0, ext.output_dim()))
-            )
-            stats = (
-                np.vstack([s.stats_2D for s in songs])
-                if songs
-                else np.zeros((0, 2 * ext.output_dim()))
-            )
-            song_ids = np.array(
-                [file_index[s.file] for s in songs], dtype=np.int32
-            )
-            paths = [s.file for s in songs]
-            song_level = SongLevel(
-                centroid=centroids,
-                stats2D=stats,
-                song_id=song_ids,
-                path=paths,
-            )
-            mf = ModelFeatures(name=ext.model_name, segments=segs, songs=song_level)
-            missing_files = [
-                f for i, f in enumerate(files) if (start_idx + i) not in song_ids
-            ]
-
-            if ext.model_name in self._model_features:
-                old = self._model_features[ext.model_name]
-                merged_segments = SegmentLevel(
-                    embeddings=np.vstack([old.segments.embeddings, segs.embeddings]),
-                    song_id=np.concatenate([old.segments.song_id, segs.song_id]),
-                    start_s=np.concatenate([old.segments.start_s, segs.start_s]),
-                    end_s=np.concatenate([old.segments.end_s, segs.end_s]),
-                )
-                n_total = start_idx + len(files)
-                padded_centroid = np.zeros(
-                    (n_total, old.songs.centroid.shape[1]), dtype=old.songs.centroid.dtype
-                )
-                padded_stats = np.zeros(
-                    (n_total, old.songs.stats2D.shape[1]), dtype=old.songs.stats2D.dtype
-                )
-                padded_centroid[old.songs.song_id] = old.songs.centroid
-                padded_stats[old.songs.song_id] = old.songs.stats2D
-                if song_ids.size:
-                    padded_centroid[song_ids] = centroids
-                    padded_stats[song_ids] = stats
-                padded_song_ids = np.arange(n_total, dtype=np.int32)
-                padded_paths = self.model.im_list + files
-                merged_songs = SongLevel(
-                    centroid=padded_centroid,
-                    stats2D=padded_stats,
-                    song_id=padded_song_ids,
-                    path=padded_paths,
-                )
-                self._model_features[ext.model_name] = ModelFeatures(
-                    name=ext.model_name, segments=merged_segments, songs=merged_songs
-                )
-            else:
-                n_total = start_idx + len(files)
-                padded_centroid = np.zeros((n_total, centroids.shape[1]), dtype=centroids.dtype)
-                padded_stats = np.zeros((n_total, stats.shape[1]), dtype=stats.dtype)
-                if song_ids.size:
-                    padded_centroid[song_ids] = centroids
-                    padded_stats[song_ids] = stats
-                padded_song_ids = np.arange(n_total, dtype=np.int32)
-                padded_paths = self.model.im_list + files
-                padded_song_level = SongLevel(
-                    centroid=padded_centroid,
-                    stats2D=padded_stats,
-                    song_id=padded_song_ids,
-                    path=padded_paths,
-                )
-                self._model_features[ext.model_name] = ModelFeatures(
-                    name=ext.model_name, segments=segs, songs=padded_song_level
-                )
-                self._model_names.append(ext.model_name)
-
-            if missing_files:
-                missing_by_model[ext.model_name] = missing_files
-                logging.warning(
-                    "No features extracted for %d file(s): %s",
-                    len(missing_files),
-                    missing_files,
-                )
-
-
-
-        features = self._model_features[self._model_names[0]].songs.stats2D
-        print('len features',len(features))
-        oc_feats = (
-            self._model_features[self._model_names[1]].songs.stats2D
-            if len(self._model_names) > 1
-            else None
-        )
-        plc_feats = (
-            self._model_features[self._model_names[2]].songs.stats2D
-            if len(self._model_names) > 2
-            else None
-        )
-
-
-        n_edges = len(self.model.cat_list)
-        app = QApplication.instance()
-        if app:
-            app.setOverrideCursor(Qt.WaitCursor)
-        base_empty_removed = 0
-        try:
-            matrix, _ = temi_cluster(
-                features, out_dim=n_edges, threshold=THRESHOLD_DEFAULT
-            )
-
-            empty_cols = np.where(matrix.sum(axis=0) == 0)[0]
-            if len(empty_cols) > 0:
-                matrix = np.delete(matrix, empty_cols, axis=1)
-                base_empty_removed = len(empty_cols)
-        except Exception as e:
-            if app:
-                app.restoreOverrideCursor()
-            QMessageBox.critical(self, "Processing Error", str(e))
-            return
-        if app:
-            app.restoreOverrideCursor()
-
-        self._show_processing_summary(base_empty_removed, missing_by_model)
-
-
-        df = pd.DataFrame(
-            matrix.astype(int),
-            columns=[f"edge_{i}" for i in range(matrix.shape[1])],
-        )
-        print('len features',len(features))
-
-        new_files = self.model.im_list + files
-        print('new_files',len(new_files))
-        print(new_files)
-        metadata = self.model.metadata
-        if metadata is not None:
-            metadata = pd.concat(
-                [metadata, pd.DataFrame(index=np.arange(len(files)))],
-                ignore_index=True,
-            )
-
-        self._disconnect_model_signals()
-
-        base_model = SessionModel(
-            new_files,
-            df,
-            features,
-            self.model.h5_path,
-            openclip_features=oc_feats,
-            places365_features=plc_feats,
-            thumbnail_data=self.model.thumbnail_data,
-            thumbnails_are_embedded=self.model.thumbnails_are_embedded,
-            metadata=metadata,
-            model_features=self._model_features,
-            model_names=self._model_names,
-        )
-        self.model = base_model
-        success = self.reconstruct_hypergraph(
-            n_edges,
-            THRESHOLD_DEFAULT,
-            JACCARD_PRUNE_DEFAULT,
-            show_dialog=False,
-        )
-        if not success:
-            self._set_new_model(base_model, JACCARD_PRUNE_DEFAULT)
-
-        self.audio_files.extend(files)
+        QMessageBox.information(
+            self,
+            "Not Supported",
+            "Adding audio to an existing session is not supported in the current "
+            "song-based workflow.",)
 
 
 
@@ -1242,87 +954,105 @@ class MainWin(QMainWindow):
         if dlg.exec_() != QDialog.Accepted:
             return
         try:
-            n_edges, thr, prune_thr, models = dlg.parameters()
+            segment_seconds, hop_seconds = dlg.parameters()
         except Exception:
             QMessageBox.warning(self, "Invalid Input", "Enter valid numbers.")
             return
-        if not models:
-            QMessageBox.warning(self, "No Model", "Select at least one model.")
-            return
-
 
         app = QApplication.instance()
         if app:
             app.setOverrideCursor(Qt.WaitCursor)
-        base_empty_removed = 0
-        missing_by_model: dict[str, list[str]] = {}            
+
         try:
-            matrices: dict[str, np.ndarray] = {}
-            features_by_model: dict[str, np.ndarray] = {}
-            model_feats: dict[str, ModelFeatures] = {}
-            file_index = {f: i for i, f in enumerate(files)}
-            for name in models:
-                if name == "CLAP":
-                    ext = CLAPFeatureExtractor()
-                elif name == "MERT":
-                    ext = MERTFeatureExtractor()
-                else:
-                    ext = OpenL3FeatureExtractor()
-                Xseg, rows, songs = ext.extract_segments_and_songs(files)
-                seg_song_ids = np.array([file_index[r["file"]] for r in rows], dtype=np.int32)
-                segs = SegmentLevel(
-                    embeddings=Xseg,
-                    song_id=seg_song_ids,
-                    start_s=np.array([r["start_s"] for r in rows], dtype=np.float32),
-                    end_s=np.array([r["end_s"] for r in rows], dtype=np.float32),
-                )
-                centroid_dim = ext.output_dim()
-                stats_dim = 2 * centroid_dim
-                if songs:
-                    centroids = np.vstack([s.centroid_D for s in songs]).astype(np.float32, copy=False)
-                    stats = np.vstack([s.stats_2D for s in songs]).astype(np.float32, copy=False)
-                else:
-                    centroids = np.zeros((0, centroid_dim), dtype=np.float32)
-                    stats = np.zeros((0, stats_dim), dtype=np.float32)
-                song_ids = np.array([file_index[s.file] for s in songs], dtype=np.int32)
-                padded_centroid = np.zeros((len(files), centroid_dim), dtype=np.float32)
-                padded_stats = np.zeros((len(files), stats_dim), dtype=np.float32)
-                if song_ids.size:
-                    padded_centroid[song_ids] = centroids
-                    padded_stats[song_ids] = stats
-                song_level = SongLevel(
-                    centroid=padded_centroid,
-                    stats2D=padded_stats,
-                    song_id=np.arange(len(files), dtype=np.int32),
-                    path=files,
-                )
-                mf = ModelFeatures(name=name, segments=segs, songs=song_level)
-                model_feats[name] = mf
-                feats = song_level.stats2D
-                features_by_model[name] = feats
-                matrix, _ = temi_cluster(feats, out_dim=n_edges, threshold=thr)
-                empty = np.where(matrix.sum(axis=0) == 0)[0]
-                if len(empty) > 0:
-                    matrix = np.delete(matrix, empty, axis=1)
-                    if name == models[0]:
-                        base_empty_removed = len(empty)
-                matrices[name] = matrix
-            missing_by_model = self._find_missing_songs(model_feats, files)
+            extractor = create_default_openl3_extractor(
+                segment_seconds=segment_seconds,
+                hop_seconds=hop_seconds,
+            )
         except Exception as e:
             if app:
                 app.restoreOverrideCursor()
-            QMessageBox.critical(self, "Generation Error", str(e))
+            QMessageBox.critical(self, "Model Error", str(e))
             return
+
+        try:
+            Xseg, rows, songs = extractor.extract_segments_and_songs(files)
+        except Exception as e:
+            if app:
+                app.restoreOverrideCursor()
+            QMessageBox.critical(self, "Extraction Error", str(e))
+            return
+
         if app:
             app.restoreOverrideCursor()
-        matrix = matrices[models[0]]
-        features = features_by_model[models[0]]
-        oc_features = features_by_model.get(models[1]) if len(models) > 1 else None
-        plc_features = features_by_model.get(models[2]) if len(models) > 2 else None
+
+        file_index = {f: i for i, f in enumerate(files)}
+        if rows:
+            seg_song_ids = np.array([file_index.get(r["file"], -1) for r in rows], dtype=np.int32)
+            start_s = np.array([r["start_s"] for r in rows], dtype=np.float32)
+            end_s = np.array([r["end_s"] for r in rows], dtype=np.float32)
+        else:
+            seg_song_ids = np.zeros((0,), dtype=np.int32)
+            start_s = np.zeros((0,), dtype=np.float32)
+            end_s = np.zeros((0,), dtype=np.float32)
+
+        segments = SegmentLevel(
+            embeddings=Xseg.astype(np.float32, copy=False),
+            song_id=seg_song_ids,
+            start_s=start_s,
+            end_s=end_s,
+        )
+
+        centroid_dim = extractor.output_dim()
+        stats_dim = centroid_dim * 2
+        centroids = np.zeros((len(files), centroid_dim), dtype=np.float32)
+        stats = np.zeros((len(files), stats_dim), dtype=np.float32)
+        for song in songs:
+            idx = file_index.get(song.file)
+            if idx is None:
+                continue
+            centroids[idx] = song.centroid_D.astype(np.float32, copy=False)
+            stats[idx] = song.stats_2D.astype(np.float32, copy=False)
+
+        song_ids = np.arange(len(files), dtype=np.int32)
+        song_level = SongLevel(
+            centroid=centroids,
+            stats2D=stats,
+            song_id=song_ids,
+            path=files,
+        )
+
+        model_name = extractor.model_name
+        model_feats = {
+            model_name: ModelFeatures(
+                name=model_name,
+                segments=segments,
+                songs=song_level,
+            )
+        }
+        features = song_level.stats2D
+
+        missing_by_model = self._find_missing_songs(model_feats, files)
+
+        name_counts: dict[str, int] = {}
+        edge_names: list[str] = []
+        for path in files:
+            base = Path(path).stem
+            count = name_counts.get(base, 0)
+            if count:
+                display = f"{base} ({count + 1})"
+            else:
+                display = base
+            name_counts[base] = count + 1
+            edge_names.append(display)
+
+        identity = np.eye(len(files), dtype=int)
+        df = pd.DataFrame(identity, columns=edge_names)
+
         self._model_features = model_feats
-        self._model_names = models
-        self._show_processing_summary(base_empty_removed, missing_by_model)        
-        df = pd.DataFrame(matrix.astype(int), columns=[f"edge_{i}" for i in range(matrix.shape[1])])
+        self._model_names = [model_name]
+
+        if missing_by_model:
+            self._show_processing_summary(0, missing_by_model)
 
         if self.model:
             self._disconnect_model_signals()
@@ -1332,20 +1062,13 @@ class MainWin(QMainWindow):
             df,
             features,
             Path(directory),
-            openclip_features=oc_features,
-            places365_features=plc_features,
             model_features=model_feats,
-            model_names=models,
+            model_names=[model_name],
+            edge_origins=["song"] * len(edge_names),
         )
-        self.model = base_model
-        success = self.reconstruct_hypergraph(
-            n_edges,
-            thr,
-            prune_thr,
-            show_dialog=False,
-        )
-        if not success:
-            self._set_new_model(base_model, prune_thr)
+
+        self._set_new_model(base_model, None)
+
 
 
     def open_session(self):
@@ -1445,143 +1168,6 @@ class MainWin(QMainWindow):
         self.spatial_dock.set_model(self.model)
         self.regroup()
 
-    def reconstruct_hypergraph(
-        self,
-        n_edges: int | None = None,
-        thr: float | None = None,
-        prune_thr: float | None = None,
-        *,
-        show_dialog: bool = True,
-    ) -> bool:
-        """Re-run clustering using existing features."""
-        if not self.model:
-            QMessageBox.warning(self, "No Session", "Please load a session first.")
-            return False
-
-        if show_dialog:
-            dlg = ReconstructDialog(len(self.model.cat_list), self)
-            if dlg.exec_() != QDialog.Accepted:
-                return False
-            try:
-                n_edges, thr, prune_thr = dlg.parameters()
-            except Exception:
-                QMessageBox.warning(self, "Invalid Input", "Enter valid numbers.")
-                return False
-        else:
-            if n_edges is None:
-                n_edges = len(self.model.cat_list)
-            if thr is None:
-                thr = THRESHOLD_DEFAULT
-            if prune_thr is None:
-                prune_thr = JACCARD_PRUNE_DEFAULT
-
-        try:
-            n_edges = int(n_edges)  # type: ignore[arg-type]
-            thr = float(thr)  # type: ignore[arg-type]
-            prune_thr = float(prune_thr)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            QMessageBox.warning(self, "Invalid Input", "Enter valid numbers.")
-            return False
-
-        app = QApplication.instance()
-        if app:
-            app.setOverrideCursor(Qt.WaitCursor)
-        base_empty_removed = 0
-        missing_by_model: dict[str, list[str]] = {}            
-        try:
-            features = self.model.features
-            oc_feats = (
-                self.model.openclip_features if len(self._model_names) > 1 else None
-            )
-            plc_feats = (
-                self.model.places365_features if len(self._model_names) > 2 else None
-            )
-
-            matrix, _ = temi_cluster(features, out_dim=n_edges, threshold=thr)
-            oc_matrix = None
-            if oc_feats is not None:
-                oc_matrix, _ = temi_cluster(oc_feats, out_dim=n_edges, threshold=thr)
-            plc_matrix = None
-            if plc_feats is not None:
-                plc_matrix, _ = temi_cluster(plc_feats, out_dim=n_edges, threshold=thr)
-
-            empty_cols = np.where(matrix.sum(axis=0) == 0)[0]
-            if len(empty_cols) > 0:
-                matrix = np.delete(matrix, empty_cols, axis=1)
-                base_empty_removed = len(empty_cols)
-            if oc_matrix is not None:
-                oc_empty = np.where(oc_matrix.sum(axis=0) == 0)[0]
-                if len(oc_empty) > 0:
-                    oc_matrix = np.delete(oc_matrix, oc_empty, axis=1)
-            if plc_matrix is not None:
-                plc_empty = np.where(plc_matrix.sum(axis=0) == 0)[0]
-                if len(plc_empty) > 0:
-                    plc_matrix = np.delete(plc_matrix, plc_empty, axis=1)
-            missing_by_model = self._find_missing_songs(
-                self._model_features or {}, self.model.im_list
-            )
-        except Exception as e:
-            if app:
-                app.restoreOverrideCursor()
-                
-            QMessageBox.critical(self, "Reconstruction Error", str(e))
-            return False
-        if app:
-            app.restoreOverrideCursor()
-        self._show_processing_summary(base_empty_removed, missing_by_model)
-        df_parts: list[pd.DataFrame] = []
-        edge_origins: list[str] = []
-
-        base_cols = [f"edge_{i}" for i in range(matrix.shape[1])]
-        df_parts.append(pd.DataFrame(matrix.astype(int), columns=base_cols))
-        edge_origins.extend(["swinv2"] * len(base_cols))
-        start_idx = len(base_cols)
-
-        if oc_matrix is not None and oc_matrix.size:
-            oc_origin = (
-                self._model_names[1].lower()
-                if len(self._model_names) > 1
-                else "openclip"
-            )
-            oc_cols = [f"{oc_origin}_{start_idx + i}" for i in range(oc_matrix.shape[1])]
-            df_parts.append(pd.DataFrame(oc_matrix.astype(int), columns=oc_cols))
-            edge_origins.extend([oc_origin] * oc_matrix.shape[1])
-            start_idx += oc_matrix.shape[1]
-
-        if plc_matrix is not None and plc_matrix.size:
-            plc_origin = (
-                self._model_names[2].lower()
-                if len(self._model_names) > 2
-                else "places365"
-            )
-            plc_cols = [
-                f"{plc_origin}_{start_idx + i}" for i in range(plc_matrix.shape[1])
-            ]
-            df_parts.append(pd.DataFrame(plc_matrix.astype(int), columns=plc_cols))
-            edge_origins.extend([plc_origin] * plc_matrix.shape[1])
-            start_idx += plc_matrix.shape[1]
-
-        df = pd.concat(df_parts, axis=1) if df_parts else pd.DataFrame()
-
-        self._disconnect_model_signals()
-
-        new_model = SessionModel(
-            self.model.im_list,
-            df,
-            features,
-            self.model.h5_path,
-            openclip_features=oc_feats,
-            places365_features=plc_feats,
-            thumbnail_data=self.model.thumbnail_data,
-            thumbnails_are_embedded=self.model.thumbnails_are_embedded,
-            metadata=self.model.metadata,
-            model_features=self._model_features,
-            model_names=self._model_names,
-            edge_origins=edge_origins if edge_origins else None,
-        )
-
-        self._set_new_model(new_model, prune_thr)
-        return True
 
     def _on_layout_changed(self):
         self._overview_triplets = None

@@ -338,6 +338,72 @@ class SessionModel(QObject):
         self.model_features: dict[str, ModelFeatures] = model_features or {}
         self.model_names: List[str] = model_names or list(self.model_features.keys())
 
+        self.edge_to_song_index: Dict[str, int] = {}
+        self.song_edge_names: Dict[int, str] = {}
+        for name, members in self.hyperedges.items():
+            if len(members) == 1:
+                idx = int(next(iter(members)))
+                self.edge_to_song_index[name] = idx
+                self.song_edge_names[idx] = name
+
+        # Determine the primary audio model (OpenL3 in current workflow)
+        self.primary_model: str | None = None
+        if self.model_names:
+            for cand in self.model_names:
+                if cand in self.model_features:
+                    self.primary_model = cand
+                    break
+        elif self.model_features:
+            self.primary_model = next(iter(self.model_features))
+
+        self.segment_embeddings = np.zeros((0, 0), dtype=np.float32)
+        self.segment_embeddings_unit = np.zeros((0, 0), dtype=np.float32)
+        self.segment_song_id = np.zeros((0,), dtype=np.int32)
+        self.segment_start_s = np.zeros((0,), dtype=np.float32)
+        self.segment_end_s = np.zeros((0,), dtype=np.float32)
+        self.song_segment_map: Dict[int, np.ndarray] = {}
+        self.song_durations = np.zeros(len(self.im_list), dtype=np.float32)
+
+        if self.primary_model:
+            mf = self.model_features.get(self.primary_model)
+            if mf:
+                seg = mf.segments
+                emb = np.asarray(seg.embeddings, dtype=np.float32)
+                if emb.ndim == 1:
+                    emb = emb.reshape(1, -1)
+                elif emb.ndim == 0:
+                    emb = np.zeros((0, 0), dtype=np.float32)
+                self.segment_embeddings = emb
+
+                self.segment_song_id = np.asarray(seg.song_id, dtype=np.int32).reshape(-1)
+                self.segment_start_s = np.asarray(seg.start_s, dtype=np.float32).reshape(-1)
+                self.segment_end_s = np.asarray(seg.end_s, dtype=np.float32).reshape(-1)
+
+                if self.segment_embeddings.size:
+                    norms = np.linalg.norm(self.segment_embeddings, axis=1, keepdims=True)
+                    norms[norms == 0] = 1.0
+                    self.segment_embeddings_unit = self.segment_embeddings / norms
+                else:
+                    self.segment_embeddings_unit = np.zeros_like(self.segment_embeddings)
+
+        emb_dim = self.segment_embeddings.shape[1] if self.segment_embeddings.ndim == 2 else 0
+        if self.segment_embeddings_unit.shape[1] != emb_dim:
+            self.segment_embeddings_unit = np.zeros((0, emb_dim), dtype=np.float32)
+
+        total_songs = len(self.im_list)
+        for idx in range(total_songs):
+            if self.segment_song_id.size:
+                indices = np.where(self.segment_song_id == idx)[0]
+            else:
+                indices = np.zeros((0,), dtype=np.int32)
+            self.song_segment_map[idx] = indices
+            if indices.size:
+                self.song_durations[idx] = float(self.segment_end_s[indices].max())
+
+        if not self.segment_embeddings.size:
+            self.segment_embeddings = np.zeros((0, emb_dim), dtype=np.float32)
+            self.segment_embeddings_unit = np.zeros((0, emb_dim), dtype=np.float32)
+
         self.overview_triplets: Dict[str, tuple[int | None, ...]] | None = None
         self.compute_overview_triplets()
 

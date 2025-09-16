@@ -83,8 +83,6 @@ def _resolve_overlaps(positions: np.ndarray, radii: np.ndarray,
 
     return pos_out32.astype(positions.dtype, copy=False)
 
-
-
 class _RecalcWorker(QtCore.QObject):
     imageEmbeddingReady = Signal(str, dict)
     layoutReady = Signal(dict)
@@ -103,6 +101,45 @@ class _RecalcWorker(QtCore.QObject):
         self.edge_index: dict[str, int] = {}
         self.radial_placement_factor = SpatialViewQDock.radial_placement_factor
 
+    def _segment_umap(self, edge_name: str) -> dict[int, np.ndarray]:
+        session = self.session
+        if session is None:
+            return {}
+        song_idx = session.edge_to_song_index.get(edge_name)
+        if song_idx is None:
+            return {}
+
+        seg_ids = session.song_segment_map.get(song_idx)
+        if seg_ids is None or seg_ids.size == 0:
+            mapping: dict[int, np.ndarray] = {}
+        else:
+            embeddings = session.segment_embeddings_unit
+            if embeddings.shape[0] == 0:
+                mapping = {}
+            else:
+                vecs = embeddings[seg_ids]
+                if vecs.shape[0] >= 2:
+                    n_neighbors = max(2, min(15, vecs.shape[0] - 1))
+                    reducer = umap.UMAP(
+                        n_components=2,
+                        random_state=42,
+                        n_neighbors=n_neighbors,
+                        min_dist=0.3,
+                        n_jobs=-1,
+                    )
+                    coords = reducer.fit_transform(vecs)
+                    coords -= coords.mean(axis=0)
+                    scale = np.linalg.norm(coords, axis=1).max()
+                    if scale > 0:
+                        coords = coords / scale
+                else:
+                    coords = np.zeros((vecs.shape[0], 2), dtype=np.float32)
+
+                mapping = {int(seg_ids[i]): coords[i] for i in range(len(seg_ids))}
+
+        self.image_umap[edge_name] = mapping
+        return mapping
+
     @pyqtSlot(str)
     def recompute(self, edge_name: str):
         session = self.session
@@ -110,43 +147,46 @@ class _RecalcWorker(QtCore.QObject):
             return
 
         if edge_name:
-            feats_norm = session.features_unit
-            mapping: dict[int, np.ndarray] = {}
-            if edge_name in session.hyperedges:
-                idx = list(session.hyperedges[edge_name])
-                if idx:
-                    emb = umap.UMAP(n_components=2, random_state=42, n_jobs=-1).fit_transform(feats_norm[idx])
-                    emb = emb - emb.mean(axis=0)
-                    m = np.max(np.linalg.norm(emb, axis=1))
-                    if m > 0:
-                        emb = emb / m
-                    mapping = {i: emb[k] for k, i in enumerate(idx)}
+            mapping = self._segment_umap(edge_name)
             self.imageEmbeddingReady.emit(edge_name, mapping)
             return
 
-        edges = list(session.hyperedges)
-        if not edges:
+        edges: list[str] = []
+        feats_list: list[np.ndarray] = []
+        diameters: list[float] = []
+        for name in session.cat_list:
+            song_idx = session.edge_to_song_index.get(name)
+            vec = session.hyperedge_avg_features.get(name)
+            if song_idx is None or vec is None:
+                continue
+            edges.append(name)
+            feats_list.append(vec.astype(np.float32, copy=False))
+            seg_ids = session.song_segment_map.get(song_idx, np.zeros((0,), dtype=np.int32))
+            seg_count = max(len(seg_ids), 1)
+            diameters.append(
+                max(np.sqrt(seg_count) * SpatialViewQDock.NODE_SIZE_SCALER,
+                    SpatialViewQDock.MIN_HYPEREDGE_DIAMETER)
+            )
+
+        if not feats_list:
             self.layoutReady.emit({})
             return
 
-        edge_feats = np.stack([session.hyperedge_avg_features[e] for e in edges]).astype(np.float32)
+        edge_feats = np.stack(feats_list).astype(np.float32)
         reducer = umap.UMAP(n_components=2, random_state=42, min_dist=0.8, n_jobs=-1)
         initial_pos = reducer.fit_transform(edge_feats)
-        diameters = np.maximum(
-            np.array([np.sqrt(len(session.hyperedges[n])) for n in edges]) * SpatialViewQDock.NODE_SIZE_SCALER,
-            SpatialViewQDock.MIN_HYPEREDGE_DIAMETER,
-        )
+        diam_array = np.asarray(diameters, dtype=np.float32)
 
         raw_scale = np.max(np.abs(initial_pos))
         if raw_scale == 0:
             raw_scale = 1.0
 
         pos_for_resolver = initial_pos * (10.0 / raw_scale)
-        radii_for_resolver = diameters / 2.0
+        radii_for_resolver = diam_array / 2.0
         resolved = _resolve_overlaps(pos_for_resolver, radii_for_resolver)
         pos = resolved - resolved.mean(axis=0)
 
-        layout = {n: (pos[i], diameters[i]) for i, n in enumerate(edges)}
+        layout = {n: (pos[i], float(diam_array[i])) for i, n in enumerate(edges)}
         self.layoutReady.emit(layout)
 
     @pyqtSlot(str)
@@ -162,78 +202,57 @@ class _RecalcWorker(QtCore.QObject):
             for n in layout.names
         }
 
-        sel_full = session.hyperedges[sel_name]
-        if not sel_full:
+        song_idx = session.edge_to_song_index.get(sel_name)
+        if song_idx is None:
             self.radialReady.emit(sel_name, {}, [])
             return
 
-        if self.limit_images_enabled:
-            idx_list = list(sel_full)
-            feats = session.features[idx_list]
-            avg = session.hyperedge_avg_features[sel_name].reshape(1, -1)
-            sims = SIM_METRIC(avg, feats)[0]
-            order = np.argsort(sims)
-            n_top = self.limit_images_value // 2
-            n_bottom = self.limit_images_value - n_top
-            chosen = [idx_list[i] for i in order[::-1][:n_top]]
-            for i in order[:n_bottom]:
-                cand = idx_list[i]
-                if cand not in chosen:
-                    chosen.append(cand)
-                if len(chosen) >= self.limit_images_value:
-                    break
-            sel_display = set(chosen)
-        else:
-            sel_display = set(sel_full)
+        seg_ids = session.song_segment_map.get(song_idx, np.zeros((0,), dtype=np.int32))
+        if seg_ids.size == 0:
+            self.radialReady.emit(sel_name, {}, [])
+            return
+
+        if self.limit_images_enabled and self.limit_images_value > 0:
+            seg_ids = seg_ids[: self.limit_images_value]
+
+        mapping = self.image_umap.get(sel_name)
+        if mapping is None or any(int(s) not in mapping for s in seg_ids):
+            mapping = self._segment_umap(sel_name)
 
         offsets: dict[tuple[str, int], np.ndarray] = {}
         links: list[tuple[tuple[str, int], tuple[str, int]]] = []
-        for idx in sel_display:
-            vec = self.image_umap.get(sel_name, {}).get(idx, np.zeros(2))
-            offsets[(sel_name, idx)] = vec * radius_map[sel_name]
+        for seg in seg_ids:
+            vec = mapping.get(int(seg), np.zeros(2))
+            offsets[(sel_name, int(seg))] = vec * radius_map[sel_name]
 
-        inter_counts: dict[str, int] = {}
-        shared_sets: dict[str, set[int]] = {}
-        for e in session.hyperedges:
-            if e == sel_name or e not in layout.names or e in self.hidden_edges:
+        embeddings = session.segment_embeddings_unit
+        if embeddings.shape[0] == 0:
+            self.radialReady.emit(sel_name, offsets, [])
+            return
+
+        other_mask = session.segment_song_id != song_idx
+        other_idx = np.flatnonzero(other_mask)
+        if other_idx.size == 0:
+            self.radialReady.emit(sel_name, offsets, [])
+            return
+
+        sel_embs = embeddings[seg_ids]
+        other_embs = embeddings[other_idx]
+        sims = sel_embs @ other_embs.T
+        best_idx = np.argmax(sims, axis=1)
+
+        for seg, idx_best in zip(seg_ids, best_idx):
+            match_seg = int(other_idx[idx_best])
+            match_song = int(session.segment_song_id[match_seg])
+            match_edge = session.song_edge_names.get(match_song)
+            if match_edge is None or match_edge not in layout.names or match_edge in self.hidden_edges:
                 continue
-            shared = session.hyperedges[e] & sel_full
-            if shared:
-                inter_counts[e] = len(shared)
-                shared_sets[e] = shared
-
-        if self.limit_edges_enabled:
-            top_edges = {
-                e
-                for e, _ in sorted(
-                    inter_counts.items(), key=lambda x: x[1], reverse=True
-                )[: self.limit_edges_value]
-            }
-        else:
-            top_edges = set(inter_counts)
-
-        for tgt, shared_full in shared_sets.items():
-            if self.limit_edges_enabled and tgt not in top_edges:
-                continue
-
-            if self.limit_images_enabled:
-                shared = shared_full & sel_display
-                if not shared:
-                    continue
-            else:
-                shared = shared_full
-
-            for idx in shared:
-                vec = self.image_umap.get(tgt, {}).get(idx, np.zeros(2))
-                offsets[(tgt, idx)] = vec * radius_map[tgt]
-                links.append(((sel_name, idx), (tgt, idx)))
-
-            extras = session.hyperedges[tgt] - shared_full
-            if self.limit_images_enabled:
-                extras = list(extras)[: self.limit_images_value]
-            for idx in extras:
-                vec = self.image_umap.get(tgt, {}).get(idx, np.zeros(2))
-                offsets[(tgt, idx)] = vec * radius_map[tgt]
+            match_map = self.image_umap.get(match_edge)
+            if match_map is None or match_seg not in match_map:
+                match_map = self._segment_umap(match_edge)
+            vec = match_map.get(match_seg, np.zeros(2))
+            offsets[(match_edge, match_seg)] = vec * radius_map[match_edge]
+            links.append(((sel_name, int(seg)), (match_edge, match_seg)))
 
         self.radialReady.emit(sel_name, offsets, links)
     
@@ -594,51 +613,11 @@ class SpatialViewQDock(QDockWidget):
         self._worker.session = self.session
         self.requestRecalc.emit("") 
         self.hidden_edges.intersection_update(session.hyperedges.keys())
-        self._features_norm = session.features_unit
-        self._centroid_norm.clear()
-        self._centroid_sim.clear()
         self._image_umap = session.image_umap or {}
-
         if not self._image_umap:
-            if not hasattr(session, "features_pca"):
-                pca = IncrementalPCA(n_components=64, batch_size=2048)
-                session.features_pca = pca.fit_transform(session.features.astype(np.float32))
-            
-            if not hasattr(session, "global_xy"):
-                reducer = umap.UMAP(
-                    n_components=2,
-                    n_neighbors=15,
-                    metric="euclidean",
-                    random_state=42,
-                    n_jobs=-1
-                )
-                session.global_xy = reducer.fit_transform(session.features_pca)
-
-            for edge in edges:
-                c = session.hyperedge_avg_features[edge].astype(np.float32)
-                c /= max(np.linalg.norm(c), 1e-9)
-                self._centroid_norm[edge] = c
-
-                idx = list(session.hyperedges[edge])
-                self._centroid_sim[edge] = self._features_norm[idx] @ c if idx else np.array([])
-
-                if idx:
-                    emb = session.global_xy[idx]
-                    emb -= emb.mean(0)
-                    r = np.linalg.norm(emb, axis=1).max()
-                    if r > 0: emb /= r
-                    self._image_umap[edge] = dict(zip(idx, emb))
-                else:
-                    self._image_umap[edge] = {}
+            self._image_umap = {name: {} for name in session.cat_list}
             session.image_umap = self._image_umap
-        else:
-            for edge in edges:
-                c = session.hyperedge_avg_features[edge].astype(np.float32)
-                c /= max(np.linalg.norm(c), 1e-9)
-                self._centroid_norm[edge] = c
 
-                idx = list(session.hyperedges[edge])
-                self._centroid_sim[edge] = self._features_norm[idx] @ c if idx else np.array([])
         print("E",time.perf_counter()-startE)
 
 
@@ -701,21 +680,28 @@ class SpatialViewQDock(QDockWidget):
         return (xr[1] - xr[0]) <= self.image_tooltip_zoom_threshold
 
     def _show_hyperedge_tooltip(self, name: str, screen_pos: QPoint):
-        if self._overview_triplets is None:
-            self._overview_triplets = self._compute_overview_triplets()
-
-        trip = self._overview_triplets.get(name)
-        if not trip or self.session is None: return
-
-        html_parts = [
-            f'<img src="{QUrl.fromLocalFile(self.session.im_list[i]).toString()}" '
-            f'width="{THUMB_SIZE}" height="{THUMB_SIZE}" style="margin:2px;">'
-            for i in trip if i is not None
-        ]
-        if not html_parts:
+        session = self.session
+        if session is None:
             return
 
-        html = f"<b>{name}</b><br>" + "".join(html_parts)
+        idxs = session.hyperedges.get(name)
+        if not idxs:
+            return
+        song_idx = next(iter(idxs))
+        if song_idx < 0 or song_idx >= len(session.im_list):
+            return
+
+        path = session.im_list[song_idx]
+        duration = getattr(session, 'song_durations', None)
+        duration_str = ''
+        if isinstance(duration, np.ndarray) and song_idx < duration.size:
+            seconds = float(duration[song_idx])
+            if seconds > 0:
+                duration_str = '<br>Duration: {:.1f} s'.format(seconds)
+        seg_ids = session.song_segment_map.get(song_idx, np.zeros((0,), dtype=np.int32))
+        seg_info = '<br>Segments: {}'.format(len(seg_ids))
+        title = '<b>{}</b><br>{}'.format(Path(path).name, path)
+        html = title + duration_str + seg_info
         self.tooltip_manager.show(screen_pos, html)
 
 
@@ -725,27 +711,23 @@ class SpatialViewQDock(QDockWidget):
         data = point.data()
         if not data:
             return
-
-        idx = data[1]
-        url: str
-        if not self._use_full and self.session.thumbnail_data:
-            if self.session.thumbnails_are_embedded:
-                thumb_bytes = self.session.thumbnail_data[idx]
-                img = qimage_from_data(thumb_bytes)
-                buf = QBuffer()
-                buf.open(QIODevice.WriteOnly)
-                img.save(buf, "PNG")
-                b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
-                url = f"data:image/png;base64,{b64}"
-                buf.close()
-            else:
-                tpath = Path(self.session.h5_path).parent / self.session.thumbnail_data[idx]
-                url = QUrl.fromLocalFile(str(tpath)).toString()
-        else:
-            fn = self.session.im_list[idx]
-            url = QUrl.fromLocalFile(fn).toString()
-
-        html = f'<img src="{url}" width="{THUMB_SIZE}" height="{THUMB_SIZE}">'
+        seg_idx = int(data[1])
+        session = self.session
+        if session.segment_song_id.size <= seg_idx:
+            return
+        song_idx = int(session.segment_song_id[seg_idx])
+        if song_idx < 0 or song_idx >= len(session.im_list):
+            return
+        path = session.im_list[song_idx]
+        start_s = 0.0
+        end_s = 0.0
+        if session.segment_start_s.size > seg_idx:
+            start_s = float(session.segment_start_s[seg_idx])
+        if session.segment_end_s.size > seg_idx:
+            end_s = float(session.segment_end_s[seg_idx])
+        seg_text = '<br>Segment: {:.1f} – {:.1f} s'.format(start_s, end_s)
+        title = '<b>{}</b><br>{}'.format(Path(path).name, path)
+        html = title + seg_text
         self.tooltip_manager.show(screen_pos, html)
 
       
@@ -1306,14 +1288,21 @@ class SpatialViewQDock(QDockWidget):
     def _on_image_clicked(self, scatter, points):
         if not points: return
         sel_nodes = {pt.data() for pt in points if pt.data()}
-        sel_imgs = [idx for (_e, idx) in sel_nodes]
-        if sel_imgs:
+        sel_segments = [idx for (_e, idx) in sel_nodes]
+        if sel_segments:
             if QApplication.keyboardModifiers() & Qt.ControlModifier:
                 self._selected_nodes.update(sel_nodes)
             else:
                 self._selected_nodes = set(sel_nodes)
             self._update_selected_overlay()
-            self.bus.set_images(sel_imgs)
+            if self.session is not None and self.session.segment_song_id.size:
+                songs = {int(self.session.segment_song_id[idx]) for idx in sel_segments
+                         if 0 <= idx < self.session.segment_song_id.size}
+                self.bus.set_images(sorted(songs))
+            else:
+                self.bus.set_images([])
+        else:
+            self.bus.set_images([])
 
     def _on_lasso(self, pts: list[QPointF]):
         if not self.fa2_layout:
@@ -1363,7 +1352,12 @@ class SpatialViewQDock(QDockWidget):
             else:
                 self._selected_nodes = set(sel_nodes)
             self._update_selected_overlay()
-            self.bus.set_images(sel_imgs)
+            if self.session is not None and self.session.segment_song_id.size:
+                songs = {int(self.session.segment_song_id[idx]) for idx in sel_imgs
+                         if 0 <= idx < self.session.segment_song_id.size}
+                self.bus.set_images(sorted(songs))
+            else:
+                self.bus.set_images([])
 
     def _goto(self,x,y):
         xr,yr=self.view.viewRange()
