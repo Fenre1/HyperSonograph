@@ -1,5 +1,6 @@
 from __future__ import annotations  
 import uuid
+import hashlib
 import numpy as np
 import pandas as pd
 import h5py
@@ -416,6 +417,59 @@ class SessionModel(QObject):
                 self.edge_to_song_index[name] = idx
                 self.song_edge_names[idx] = name
 
+    @staticmethod
+    def _color_from_seed(seed: str) -> str:
+        """Derive a vivid color hex string from an arbitrary seed."""
+
+        digest = hashlib.sha1(seed.encode("utf-8")).digest()
+        hue = digest[0] / 255.0
+        saturation = 0.55 + (digest[1] / 255.0) * 0.4
+        value = 0.75 + (digest[2] / 255.0) * 0.2
+        color = QColor()
+        color.setHsvF(hue, min(saturation, 1.0), min(value, 1.0))
+        return color.name()
+
+    def _assign_unique_color(self, name: str, *, used: set[str] | None = None) -> str:
+        """Assign a color that is not currently in use to ``name``."""
+
+        if used is None:
+            used = set(self.edge_colors.values())
+            current = self.edge_colors.get(name)
+            if current:
+                used.discard(current)
+
+        attempt = 0
+        while True:
+            candidate = self._color_from_seed(f"{name}:{attempt}")
+            attempt += 1
+            if candidate not in used:
+                self.edge_colors[name] = candidate
+                used.add(candidate)
+                return candidate
+
+    def _ensure_unique_edge_colors(self) -> None:
+        """Ensure all hyperedges have distinct colors."""
+
+        if not self.edge_colors:
+            return
+
+        ordered_names = [name for name in self.cat_list if name in self.edge_colors]
+        current_colors = [self.edge_colors[name] for name in ordered_names]
+        if len(set(current_colors)) == len(current_colors):
+            return
+
+        used: set[str] = set()
+        for name in self.cat_list:
+            current = self.edge_colors.get(name)
+            if current and current not in used:
+                used.add(current)
+                continue
+            self._assign_unique_color(name, used=used)
+
+        extras = set(self.edge_colors.keys()) - set(self.cat_list)
+        for extra in extras:
+            self.edge_colors.pop(extra, None)
+
     def _refresh_segment_cache(self) -> None:
         emb_dim = 0
         if self.primary_model:
@@ -583,18 +637,16 @@ class SessionModel(QObject):
 
         self.status_map[name] = {"uuid": str(uuid.uuid4()), "status": "New"}
         self.edge_origins[name] = "New"
-        self.edge_colors[name] = generate_n_colors(len(self.edge_colors) + 1)[-1]
-
-        idx = len(self.edge_colors)
-        cmap_hues = max(idx + 1, 16)
-        self.edge_colors[name] = pg.mkColor(pg.intColor(idx, hues=cmap_hues)).name()
+        self._assign_unique_color(name)
         self.edge_seen_times[name] = 0.0
         self.overview_triplets = None
+        self._ensure_unique_edge_colors()
         print('12',time.perf_counter() - start12)
         self.layoutChanged.emit()
         print('13',time.perf_counter() - start12)
         self.hyperedgeModified.emit(name)
         print('14',time.perf_counter() - start12)
+
 
     def add_images_to_hyperedge(self, name: str, idxs: Iterable[int]) -> None:
         """Add selected images to an existing hyperedge."""
@@ -721,6 +773,7 @@ class SessionModel(QObject):
         self.cat_list.extend(edge_names)
 
         # Prepare new feature vectors for hyperedges
+        used_colors = set(self.edge_colors.values())        
         for offset, name in enumerate(edge_names):
             row_idx = start_idx + offset
             self.df_edges.at[row_idx, name] = 1
@@ -733,11 +786,11 @@ class SessionModel(QObject):
             )
             self.hyperedge_avg_features[name] = vec
             self.status_map[name] = {"uuid": str(uuid.uuid4()), "status": "New"}
-            color_idx = len(self.edge_colors)
-            cmap_hues = max(color_idx + 1, 16)
-            self.edge_colors[name] = pg.mkColor(pg.intColor(color_idx, hues=cmap_hues)).name()
+            self._assign_unique_color(name, used=used_colors)
             self.edge_origins[name] = origin
             self.edge_seen_times[name] = 0.0
+
+        self._ensure_unique_edge_colors()
 
         if new_features.size:
             self.features = np.vstack([self.features, new_features])
@@ -915,6 +968,7 @@ class SessionModel(QObject):
             n_features = self.features.shape[1]
             self.hyperedge_avg_features[orphan_name] = np.zeros(n_features)
             self.status_map[orphan_name] = {"uuid": str(uuid.uuid4()), "status": "Orphaned"}
+            self._assign_unique_color(orphan_name)            
             self.edge_colors[orphan_name] = generate_n_colors(len(self.edge_colors) + 1)[-1]
             self.edge_origins[orphan_name] = "system"
             self.edge_seen_times[orphan_name] = 0.0
@@ -938,6 +992,7 @@ class SessionModel(QObject):
         if self.overview_triplets is not None:
             self.overview_triplets.pop(name, None)
             self.overview_triplets.pop(orphan_name, None)
+        self._ensure_unique_edge_colors()            
         self.layoutChanged.emit()
         self.similarityDirty.emit()
         self.hyperedgeModified.emit(orphan_name)
