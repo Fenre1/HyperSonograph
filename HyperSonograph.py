@@ -813,7 +813,7 @@ class MainWin(QMainWindow):
         self._overview_triplets = None
         self.temi_results = {}
         self.bus = SelectionBus()
-        # self.bus.edgesChanged.connect(self._update_bus_images)
+        self.bus.edgesChanged.connect(self._update_bus_images)
 
         self.bus.edgesChanged.connect(self._remember_last_edge)
 
@@ -1054,7 +1054,7 @@ class MainWin(QMainWindow):
 
         files = get_audio_files(directory)
         if not files:
-            QMessageBox.information(self, "No Audio", "No supported audio files found.")
+            QMessageBox.information(self, "No Audio", "No supported audio files found in" +str(directory) + ".")
             return
 
         existing = {str(Path(p).resolve()) for p in self.model.im_list}
@@ -1532,6 +1532,7 @@ class MainWin(QMainWindow):
         self.audio_table.set_use_full_images(True)
         self.thumb_toggle_act.setChecked(True)
         self._update_similarity_buttons_state()
+        self.audio_player.set_session(self.model)
         self.spatial_dock.set_model(self.model)
         self.regroup()
 

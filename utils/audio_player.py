@@ -61,13 +61,13 @@ class AudioPlayerDock(QDockWidget):
             # Resolve relative to this file (/utils/audio_player.py)
             here = Path(__file__).resolve().parent
             base = here.parent / "vlc_player_folder"
-
+            print(base)
             os.environ.setdefault("PYTHON_VLC_LIB_PATH", str(base / "libvlc.dll"))
             os.environ.setdefault("VLC_PLUGIN_PATH", str(base / "plugins"))
 
         _ensure_vlc_paths()
         import vlc
-        
+
         self._session: SessionModel | None = None
         self._selected_index: int | None = None
         self._loaded_index: int | None = None
@@ -152,6 +152,7 @@ class AudioPlayerDock(QDockWidget):
         self._session = session
         self._selected_index = None
         self._reset_player()
+        print('setting session')
         self._update_title()
         self._update_play_button_state()
 
