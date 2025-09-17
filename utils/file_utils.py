@@ -20,24 +20,37 @@ def _is_hidden_or_system(path: str) -> bool:
     return base.startswith(".")
 
 def get_audio_files(directory: str) -> List[str]:
-    """
-    Recursively scan for MP3/WAV, skip hidden/system/zero-byte files.
-    """
-    exts = ("mp3", "MP3", "wav", "WAV")
-    file_paths = []
-    for ext in exts:
-        pattern = os.path.join(directory, "**", f"*.{ext}")
-        file_paths.extend(glob.glob(pattern, recursive=True))
+    """Recursively scan ``directory`` for supported audio files.
 
-    # Normalize, dedupe, filter
-    cleaned = []
-    for p in set(os.path.normpath(fp) for fp in file_paths):
-        try:
-            if _is_hidden_or_system(p):
+    Uses ``os.walk`` so that directory names containing glob meta-characters
+    (``[]``, ``?`` …) are handled correctly. Hidden/system entries and empty
+    files are skipped to match the previous behaviour.
+    """
+
+    directory = os.fspath(directory)
+    # normalise extensions once to avoid repeated allocations inside the loop
+    exts = {".mp3", ".wav"}
+    collected: List[str] = []
+
+    for root, dirs, files in os.walk(directory):
+        # Skip hidden/system directories to avoid traversing them entirely
+        dirs[:] = [
+            d for d in dirs
+            if not _is_hidden_or_system(os.path.join(root, d))
+        ]
+
+        for name in files:
+            path = os.path.normpath(os.path.join(root, name))
+            if os.path.splitext(name)[1].lower() not in exts:
                 continue
-            if os.path.getsize(p) == 0:
+            try:
+                if _is_hidden_or_system(path):
+                    continue
+                if os.path.getsize(path) == 0:
+                    continue
+            except OSError:
                 continue
-        except OSError:
-            continue
-        cleaned.append(p)
-    return sorted(cleaned)
+            collected.append(path)
+
+    # ``set`` removes duplicates, ``sorted`` keeps deterministic ordering
+    return sorted(set(collected))
