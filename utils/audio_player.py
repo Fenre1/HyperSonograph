@@ -74,6 +74,7 @@ class AudioPlayerDock(QDockWidget):
         self._duration_ms: int = 0
         self._user_seeking = False
         self._vlc_error: str | None = None
+        self._similarity_pair: dict | None = None
 
         container = QWidget(self)
         layout = QVBoxLayout(container)
@@ -97,7 +98,14 @@ class AudioPlayerDock(QDockWidget):
         controls.addWidget(self.total_time_label)
         controls.addStretch()
         layout.addLayout(controls)
-
+       
+        segment_controls = QHBoxLayout()
+        self.play_ref_segment_button = QPushButton("Play Ref Segment", container)
+        self.play_match_segment_button = QPushButton("Play Match Segment", container)
+        segment_controls.addWidget(self.play_ref_segment_button)
+        segment_controls.addWidget(self.play_match_segment_button)
+        segment_controls.addStretch()
+        layout.addLayout(segment_controls)
         self.position_slider = QSlider(Qt.Horizontal, container)
         self.position_slider.setEnabled(False)
         layout.addWidget(self.position_slider)
@@ -108,6 +116,9 @@ class AudioPlayerDock(QDockWidget):
         self._update_timer.setInterval(200)
 
         self.play_button.clicked.connect(self._toggle_playback)
+        self.play_ref_segment_button.clicked.connect(self._play_reference_segment)
+        self.play_match_segment_button.clicked.connect(self._play_match_segment)
+
         self.position_slider.sliderPressed.connect(self._on_slider_pressed)
         self.position_slider.sliderReleased.connect(self._on_slider_released)
         self.position_slider.sliderMoved.connect(self._on_slider_moved)
@@ -115,14 +126,21 @@ class AudioPlayerDock(QDockWidget):
         self.current_time_edit.returnPressed.connect(self._apply_time_edit)
         self.current_time_edit.editingFinished.connect(self._apply_time_edit)
         self.bus.imagesChanged.connect(self._on_images_selected)
+        
 
         self.current_time_edit.setEnabled(False)
+        self.play_ref_segment_button.setEnabled(False)
+        self.play_match_segment_button.setEnabled(False)
+        self.play_ref_segment_button.setToolTip("")
+        self.play_match_segment_button.setToolTip("")
 
         if vlc is None:
             self._instance = None
             self._player = None
             self._vlc_error = "python-vlc is not available. Install VLC to enable playback."
             self.play_button.setEnabled(False)
+            self.play_ref_segment_button.setEnabled(False)
+            self.play_match_segment_button.setEnabled(False)
         else:
             try:                
                 self._instance = vlc.Instance()
@@ -143,6 +161,7 @@ class AudioPlayerDock(QDockWidget):
 
         self._update_title()
         self._update_play_button_state()
+        self.set_similarity_pair(None)
 
     # ------------------------------------------------------------------
     # Public API
@@ -151,8 +170,8 @@ class AudioPlayerDock(QDockWidget):
         """Update the player with a new session."""
         self._session = session
         self._selected_index = None
+        self.set_similarity_pair(None)
         self._reset_player()
-        print('setting session')
         self._update_title()
         self._update_play_button_state()
 
@@ -270,6 +289,46 @@ class AudioPlayerDock(QDockWidget):
         self._update_play_button_state()
         self._update_title()
 
+    def set_similarity_pair(self, payload: dict | None) -> None:
+        """Update the segment-specific playback controls."""
+
+        self._similarity_pair = payload if payload else None
+
+        has_player = self._player is not None and self._session is not None
+        if not payload or not has_player:
+            self.play_ref_segment_button.setEnabled(False)
+            self.play_match_segment_button.setEnabled(False)
+            self.play_ref_segment_button.setToolTip("")
+            self.play_match_segment_button.setToolTip("")
+            return
+
+        ref_name = str(payload.get("reference_name", "Reference"))
+        match_name = str(payload.get("comparison_name", "Match"))
+        ref_start = max(0.0, float(payload.get("reference_start_s", 0.0)))
+        ref_end = max(ref_start, float(payload.get("reference_end_s", ref_start)))
+        match_start = max(0.0, float(payload.get("comparison_start_s", 0.0)))
+        match_end = max(match_start, float(payload.get("comparison_end_s", match_start)))
+        similarity = float(payload.get("similarity", 0.0))
+
+        ref_tip = self._format_segment_tooltip(ref_name, ref_start, ref_end, similarity)
+        match_tip = self._format_segment_tooltip(match_name, match_start, match_end, similarity)
+
+        self.play_ref_segment_button.setToolTip(ref_tip)
+        self.play_match_segment_button.setToolTip(match_tip)
+        self.play_ref_segment_button.setEnabled(True)
+        self.play_match_segment_button.setEnabled(True)
+
+    def _format_segment_tooltip(
+        self, name: str, start_s: float, end_s: float, similarity: float
+    ) -> str:
+        start_ms = int(max(0.0, start_s) * 1000)
+        end_ms = int(max(start_s, end_s) * 1000)
+        text = f"{name}\nSegment: {_format_millis(start_ms)} – {_format_millis(end_ms)}"
+        text += f"\nSimilarity: {similarity:.3f}"
+        return text
+
+
+
     # ------------------------------------------------------------------
     # UI updates
     # ------------------------------------------------------------------
@@ -300,6 +359,12 @@ class AudioPlayerDock(QDockWidget):
             and (self._selected_index is not None or self._loaded_index is not None)
         )
         self.play_button.setEnabled(enabled)
+        if self._player is None or self._session is None or not self._similarity_pair:
+            self.play_ref_segment_button.setEnabled(False)
+            self.play_match_segment_button.setEnabled(False)
+        else:
+            self.play_ref_segment_button.setEnabled(True)
+            self.play_match_segment_button.setEnabled(True)
 
     def _track_name(self, idx: int) -> str:
         if not self._session or not (0 <= idx < len(self._session.im_list)):
@@ -367,6 +432,56 @@ class AudioPlayerDock(QDockWidget):
         with QSignalBlocker(self.position_slider):
             self.position_slider.setValue(desired)
         self.current_time_edit.setText(_format_millis(desired))
+
+    def _play_reference_segment(self) -> None:
+        if not self._similarity_pair:
+            return
+        idx = self._similarity_pair.get("reference_index")
+        start = self._similarity_pair.get("reference_start_s")
+        if idx is None or start is None:
+            return
+        self._play_segment_at(int(idx), int(max(0.0, float(start)) * 1000))
+
+    def _play_match_segment(self) -> None:
+        if not self._similarity_pair:
+            return
+        idx = self._similarity_pair.get("comparison_index")
+        start = self._similarity_pair.get("comparison_start_s")
+        if idx is None or start is None:
+            return
+        self._play_segment_at(int(idx), int(max(0.0, float(start)) * 1000))
+
+    def _play_segment_at(self, song_idx: int, start_ms: int) -> None:
+        if not self._player or not self._session:
+            return
+
+        if self._loaded_index != song_idx:
+            if not self._load_index(song_idx):
+                return
+
+        if not self._player.get_media():
+            return
+
+        if not self._player.is_playing():
+            result = self._player.play()
+            if result == -1:  # pragma: no cover - VLC error handling
+                QMessageBox.warning(
+                    self,
+                    "Audio Player",
+                    "Unable to play the selected audio file.",
+                )
+                return
+
+        start_ms = max(0, int(start_ms))
+        self._player.set_time(start_ms)
+        with QSignalBlocker(self.position_slider):
+            self.position_slider.setValue(start_ms)
+        if not self.current_time_edit.hasFocus():
+            self.current_time_edit.setText(_format_millis(start_ms))
+        self.play_button.setText("Pause")
+        self._update_timer.start()
+        self._update_title()
+        self._update_play_button_state()
 
     def _handle_finished(self) -> None:
         if self._player:

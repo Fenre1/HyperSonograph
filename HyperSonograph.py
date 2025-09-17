@@ -961,7 +961,9 @@ class MainWin(QMainWindow):
         # --- Audio Player ---
         self.audio_player = AudioPlayerDock(self.bus, self)
         self.audio_player.setObjectName("AudioPlayerDock")
-
+        self.audio_table.similarityPairSelected.connect(
+            self.audio_player.set_similarity_pair
+        )
 
         # --- Grouping Slider (no longer in central widget) ---
         # We can place these controls in one of the docks, e.g., the 'Buttons' dock.

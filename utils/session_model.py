@@ -11,6 +11,7 @@ from PyQt5.QtCore import QObject, pyqtSignal as Signal
 from PyQt5.QtGui import QColor
 import pyqtgraph as pg
 import time
+from dataclasses import dataclass
 from .similarity import SIM_METRIC
 from .audio_schema import SegmentLevel, SongLevel, ModelFeatures
 
@@ -28,7 +29,19 @@ def jaccard_similarity(a: Set[int], b: Set[int]) -> float:
         return 1.0
     return len(a & b) / len(a | b)
 
+@dataclass(frozen=True)
+class SegmentMatchResult:
+    """Best matching segment pair between two songs."""
 
+    song_a: int
+    song_b: int
+    segment_a: int
+    segment_b: int
+    start_a: float
+    start_b: float
+    end_a: float
+    end_b: float
+    score: float
 
 class SessionModel(QObject):
     edgeRenamed      = Signal(str, str)      # old, new
@@ -1044,6 +1057,83 @@ class SessionModel(QObject):
 
     def has_segment_features(self) -> bool:
         return bool(self.segment_embeddings_unit.size)
+
+    def best_matching_segment_pair(
+        self, song_a: int, song_b: int
+    ) -> SegmentMatchResult | None:
+        """Return the most similar segment pair between two songs.
+
+        Parameters
+        ----------
+        song_a, song_b:
+            Indices of the songs whose segments should be compared.
+
+        Returns
+        -------
+        SegmentMatchResult | None
+            Details about the best-matching segments, or ``None`` if no
+            comparison could be made.
+        """
+
+        if not self.has_segment_features():
+            return None
+
+        indices_a = self.song_segment_map.get(song_a)
+        indices_b = self.song_segment_map.get(song_b)
+        if indices_a is None or indices_b is None:
+            return None
+        if indices_a.size == 0 or indices_b.size == 0:
+            return None
+
+        vecs_a = self.segment_embeddings_unit[indices_a]
+        vecs_b = self.segment_embeddings_unit[indices_b]
+        if vecs_a.size == 0 or vecs_b.size == 0:
+            return None
+
+        sims = np.matmul(vecs_a, vecs_b.T)
+        if sims.size == 0:
+            return None
+
+        best_flat = int(np.argmax(sims))
+        score = float(sims.flat[best_flat])
+        cols = sims.shape[1]
+        pos_a = best_flat // cols
+        pos_b = best_flat % cols
+        seg_idx_a = int(indices_a[pos_a])
+        seg_idx_b = int(indices_b[pos_b])
+
+        start_a = (
+            float(self.segment_start_s[seg_idx_a])
+            if self.segment_start_s.size > seg_idx_a
+            else 0.0
+        )
+        end_a = (
+            float(self.segment_end_s[seg_idx_a])
+            if self.segment_end_s.size > seg_idx_a
+            else start_a
+        )
+        start_b = (
+            float(self.segment_start_s[seg_idx_b])
+            if self.segment_start_s.size > seg_idx_b
+            else 0.0
+        )
+        end_b = (
+            float(self.segment_end_s[seg_idx_b])
+            if self.segment_end_s.size > seg_idx_b
+            else start_b
+        )
+
+        return SegmentMatchResult(
+            song_a=song_a,
+            song_b=song_b,
+            segment_a=seg_idx_a,
+            segment_b=seg_idx_b,
+            start_a=start_a,
+            start_b=start_b,
+            end_a=end_a,
+            end_b=end_b,
+            score=score,
+        )
 
     def has_song_level_features(self) -> bool:
         if not self.primary_model:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
-from typing import List, Sequence
+from typing import List, Optional, Sequence
+
 
 from PyQt5.QtCore import Qt, QSortFilterProxyModel, pyqtSignal as Signal
 from PyQt5.QtGui import QStandardItem, QStandardItemModel
@@ -16,16 +18,22 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
 )
 
-from .session_model import SessionModel
+from .session_model import SegmentMatchResult, SessionModel
 from .selection_bus import SelectionBus
+INDEX_ROLE = Qt.UserRole + 1
 
 
 class _AudioTable(QWidget):
     """Widget showing a filterable table of audio files."""
 
+    selectionChanged = Signal(list)
+
     def __init__(self, session: SessionModel, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._session = session
+        self._is_similarity_tab = False
+        self._similarity_ref_index: int | None = None
+        self._similarity_ref_name: str | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -51,10 +59,19 @@ class _AudioTable(QWidget):
         layout.addWidget(self.view)
 
         self.filter_edit.textChanged.connect(self.proxy.setFilterFixedString)
+        self.view.selectionModel().selectionChanged.connect(self._on_selection_changed)
+
+    @property
+    def session(self) -> SessionModel:
+        return self._session
 
     def set_indices(self, idxs: List[int]) -> None:
         """Populate the table with the given session indices."""
         self.model.setRowCount(0)
+        self.view.clearSelection()
+        self._is_similarity_tab = False
+        self._similarity_ref_index = None
+        self._similarity_ref_name = None
         paths = self._session.im_list
         for idx in idxs:
             if 0 <= idx < len(paths):
@@ -64,11 +81,24 @@ class _AudioTable(QWidget):
                     QStandardItem(p),
                     QStandardItem("0.0"),  # placeholder for similarity
                 ]
+                for item in items:
+                    item.setEditable(False)
+                    item.setData(int(idx), INDEX_ROLE)
                 self.model.appendRow(items)
 
-    def set_similarity(self, pairs: Sequence[tuple[int, float]]) -> None:
+    def set_similarity(
+        self,
+        pairs: Sequence[tuple[int, float]],
+        *,
+        ref_index: int | None = None,
+        ref_name: str | None = None,
+    ) -> None:
         """Populate the table with indices and similarity scores."""
         self.model.setRowCount(0)
+        self.view.clearSelection()
+        self._is_similarity_tab = True
+        self._similarity_ref_index = ref_index
+        self._similarity_ref_name = ref_name
         paths = self._session.im_list
         for idx, score in pairs:
             if 0 <= idx < len(paths):
@@ -77,14 +107,59 @@ class _AudioTable(QWidget):
                 path_item = QStandardItem(path)
                 sim_item = QStandardItem(f"{score:.3f}")
                 sim_item.setData(float(score), Qt.EditRole)
+                for item in (name_item, path_item, sim_item):
+                    item.setEditable(False)
+                    item.setData(int(idx), INDEX_ROLE)
                 self.model.appendRow([name_item, path_item, sim_item])
         self.view.sortByColumn(2, Qt.DescendingOrder)
+
+    def is_similarity_tab(self) -> bool:
+        return self._is_similarity_tab
+
+    def similarity_reference_index(self) -> int | None:
+        return self._similarity_ref_index
+
+    def similarity_reference_name(self) -> Optional[str]:
+        return self._similarity_ref_name
+
+    def selected_song_indices(self) -> List[int]:
+        selection = self.view.selectionModel()
+        if selection is None:
+            return []
+        idxs: list[int] = []
+        for proxy_idx in selection.selectedRows():
+            src = self.proxy.mapToSource(proxy_idx)
+            if not src.isValid():
+                continue
+            item = self.model.item(src.row(), 0)
+            if not item:
+                continue
+            value = item.data(INDEX_ROLE)
+            if isinstance(value, (int, float)):
+                idxs.append(int(value))
+        return idxs
+
+    def best_segment_match(self, other_song_idx: int) -> SegmentMatchResult | None:
+        if not self._is_similarity_tab:
+            return None
+        if self._similarity_ref_index is None:
+            return None
+        if not self._session.has_segment_features():
+            return None
+        return self._session.best_matching_segment_pair(
+            self._similarity_ref_index,
+            int(other_song_idx),
+        )
+
+    def _on_selection_changed(self, *_args) -> None:
+        self.selectionChanged.emit(self.selected_song_indices())
 
 class AudioTableDock(QDockWidget):
     """Dock widget containing filterable tables of audio files for each model."""
 
     historyChanged = Signal()
     labelDoubleClicked = Signal(str)
+    similarityPairSelected = Signal(object)
 
     def __init__(self, bus: SelectionBus, parent: QWidget | None = None) -> None:
         super().__init__("Audio Files", parent)
@@ -120,6 +195,7 @@ class AudioTableDock(QDockWidget):
     def add_model(self, name: str, session: SessionModel) -> None:
         table = _AudioTable(session, self)
         self.tabs.addTab(table, name)
+        self._configure_table(table)        
         self._sessions[name] = session
         # show all files initially
         table.set_indices(list(range(len(session.im_list))))
@@ -144,13 +220,16 @@ class AudioTableDock(QDockWidget):
                     table = _AudioTable(session, self)
                     self.tabs.removeTab(idx)
                     self.tabs.insertTab(idx, table, tab_title)
+                    self._configure_table(table)                    
                 break
 
         if table is None:
             table = _AudioTable(session, self)
             self.tabs.addTab(table, tab_title)
+            self._configure_table(table)
 
-        table.set_similarity(results)
+        ref_idx = session.edge_to_song_index.get(ref_name)
+        table.set_similarity(results, ref_index=ref_idx, ref_name=ref_name)
         self._sessions[tab_title] = session
         self.tabs.setCurrentWidget(table)
 
@@ -168,6 +247,7 @@ class AudioTableDock(QDockWidget):
         self._sessions.clear()
         self._history.clear()
         self._hist_pos = -1
+        self.similarityPairSelected.emit(None)        
 
     # Methods used by existing code -----------------------------------
     def update_images(self, idxs: List[int], **kwargs) -> None:  # type: ignore[override]
@@ -178,6 +258,7 @@ class AudioTableDock(QDockWidget):
             self._history.append(idxs)
             self._hist_pos += 1
             self.historyChanged.emit()
+        self.similarityPairSelected.emit(None)            
 
     def show_overview(self, triplets, session: SessionModel) -> None:
         idxs: List[int] = []
@@ -218,3 +299,40 @@ class AudioTableDock(QDockWidget):
         # Reset history when switching tabs
         self._history.clear()
         self._hist_pos = -1
+        self.similarityPairSelected.emit(None)
+
+    def _configure_table(self, table: _AudioTable) -> None:
+        table.selectionChanged.connect(partial(self._handle_table_selection, table))
+
+    def _handle_table_selection(self, table: _AudioTable, indices: List[int]) -> None:
+        unique = sorted({int(i) for i in indices})
+        self.bus.set_images(unique)
+
+        payload: Optional[dict] = None
+        if table.is_similarity_tab() and len(unique) == 1:
+            ref_idx = table.similarity_reference_index()
+            match_idx = unique[0]
+            if ref_idx is not None:
+                match = table.best_segment_match(match_idx)
+                if match:
+                    session = table.session
+                    ref_name = table.similarity_reference_name() or Path(
+                        session.im_list[match.song_a]
+                    ).name
+                    match_name = Path(session.im_list[match.song_b]).name
+                    payload = {
+                        "reference_index": int(match.song_a),
+                        "comparison_index": int(match.song_b),
+                        "reference_start_s": float(match.start_a),
+                        "comparison_start_s": float(match.start_b),
+                        "reference_end_s": float(match.end_a),
+                        "comparison_end_s": float(match.end_b),
+                        "reference_name": ref_name,
+                        "comparison_name": match_name,
+                        "similarity": float(match.score),
+                    }
+
+        if payload is None:
+            self.similarityPairSelected.emit(None)
+        else:
+            self.similarityPairSelected.emit(payload)
