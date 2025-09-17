@@ -434,7 +434,7 @@ extractors = af.build_windows_extractors(
 print("Enabled models:")
 for e in extractors:
     e.normalize = False
-extractors[3].target_sr = 16000
+# extractors[3].target_sr = 16000
 for e in extractors:
     print(f"  - {e.model_name} (target_sr={e.target_sr}, device={e.device})")
 
@@ -446,7 +446,8 @@ multi = af.MultiModelAudioExtractor(
     ref_sr=48_000,
     normalize=False,
 )
-
+#%%
+Xseg, rows, songs = extractor.extract_segments_and_songs(files)
 #%%
 # --- Run extraction ---
 if COMBINE == "concat":
@@ -462,20 +463,6 @@ if COMBINE == "concat":
     } for s in songs])
 
     print(f"\nSegments: {X.shape[0]} rows, dim={X.shape[1] if X.size else 0}")
-    display(rows_df.head())
-    display(songs_df.head())
-
-    if SAVE_PREFIX:
-        pref = Path(SAVE_PREFIX)
-        pref.parent.mkdir(parents=True, exist_ok=True)
-        np.save(pref.with_suffix(".segments.npy"), X)
-        rows_df.to_csv(pref.with_suffix(".segments_meta.csv"), index=False)
-        np.save(pref.with_suffix(".songs_centroid.npy"),
-                np.vstack([np.array(s.centroid_D, dtype=np.float32) for s in songs]) if songs else np.zeros((0,0), np.float32))
-        np.save(pref.with_suffix(".songs_stats.npy"),
-                np.vstack([np.array(s.stats_2D, dtype=np.float32) for s in songs]) if songs else np.zeros((0,0), np.float32))
-        songs_df.drop(columns=["centroid_D","stats_2D"]).to_csv(pref.with_suffix(".songs_meta.csv"), index=False)
-        print(f"Saved to prefix: {pref}")
 
 else:
     # "separate": keep each model’s array separately (no forced vstack)
@@ -505,19 +492,11 @@ else:
     for name, X_i, rows_df_i in per_model:
         print(f"\nModel: {name} -> segments: {X_i.shape[0]}, dim: {X_i.shape[1] if X_i.size else 0}")
 
-    # Optional save
-    if SAVE_PREFIX:
-        pref = Path(SAVE_PREFIX)
-        pref.parent.mkdir(parents=True, exist_ok=True)
-        for name, X_i, rows_df_i in per_model:
-            safe = name.replace("/", "_").replace(" ", "_")
-            np.save(pref.with_name(pref.name + f".{safe}.segments.npy"), X_i)
-            rows_df_i.to_csv(pref.with_name(pref.name + f".{safe}.segments_meta.csv"), index=False)
-        print(f"\nSaved per-model outputs with prefix: {pref}")
+
 # %%
 import matplotlib.pyplot as plt
 
-model_id = 3
+model_id = 2
 cors = _cos([per_model[model_id][1][2],per_model[model_id][1][28]])
 print(cors)
 cosses_pos = []
@@ -532,16 +511,13 @@ for ind, seg in enumerate(per_model[model_id][1]):
     for indx, segx in enumerate(per_model[model_id][1]):
         cors = _cos([seg,segx])
         
-        per_song_cors[np.where(unq==per_model[model_id][2].iloc[30]['file'])[0][0]].append(cors[1,0])
+        per_song_cors[np.where(unq==per_model[model_id][2].iloc[ind]['file'])[0][0]].append(cors[1,0])
         if per_model[model_id][2].iloc[ind]['file'] == per_model[model_id][2].iloc[indx]['file']:
             if indx != ind:
                 cosses_pos.append(cors[1,0])
         else:
             cosses_neg.append(cors[1,0])
 
-#%%
-
-per_song_cors_arr = np.array([per_song_cors])
 #%%
 plt.plot(cosses_neg)
 plt.plot(cosses_pos)

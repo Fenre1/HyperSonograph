@@ -62,7 +62,7 @@ from utils.audio_table import AudioTableDock
 from utils.audio_schema import SegmentLevel, SongLevel, ModelFeatures
 
 from utils.spatial_viewQv4 import SpatialViewQDock, HyperedgeItem
-from utils.feature_extraction import create_default_openl3_extractor
+from utils.feature_extraction import create_default_openl3_extractor_torch as create_default_openl3_extractor
 from utils.file_utils import get_audio_files
 from utils.session_stats import show_session_stats
 from utils.metadata_overview import show_metadata_overview
