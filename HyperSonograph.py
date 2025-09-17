@@ -66,7 +66,7 @@ from utils.feature_extraction import create_default_openl3_extractor_torch as cr
 from utils.file_utils import get_audio_files
 from utils.session_stats import show_session_stats
 from utils.metadata_overview import show_metadata_overview
-from utils.hyperedge_matrix2 import HyperedgeMatrixDock
+from utils.audio_player import AudioPlayerDock
 
 # from clustering.temi_clustering import temi_cluster
 
@@ -958,11 +958,10 @@ class MainWin(QMainWindow):
         self.limit_edges_edit.editingFinished.connect(self._update_spatial_limits)
         self._update_spatial_limits()
 
+        # --- Audio Player ---
+        self.audio_player = AudioPlayerDock(self.bus, self)
+        self.audio_player.setObjectName("AudioPlayerDock")
 
-
-        # --- Hyperedge Matrix ---
-        self.matrix_dock = HyperedgeMatrixDock(self.bus, self)
-        self.matrix_dock.setObjectName("HyperedgeMatrixDock")
 
         # --- Grouping Slider (no longer in central widget) ---
         # We can place these controls in one of the docks, e.g., the 'Buttons' dock.
@@ -989,13 +988,13 @@ class MainWin(QMainWindow):
         # 4. Add the "Spatial view" below the "Image grid".
         self.addDockWidget(Qt.RightDockWidgetArea, self.spatial_dock)
 
-        # 5. Split the area occupied by the "Spatial view" to place the "Hyperedge matrix" to its right.
-        self.splitDockWidget(self.spatial_dock, self.matrix_dock, Qt.Horizontal)
+        # 5. Split the area occupied by the "Spatial view" to place the audio player to its right.
+        self.splitDockWidget(self.spatial_dock, self.audio_player, Qt.Horizontal)
 
         # Optional: Set initial relative sizes of the docks
         self.resizeDocks([self.tree_dock, self.audio_table], [300, 850], Qt.Horizontal)
         self.resizeDocks([self.tree_dock, self.toolbar_dock], [550, 250], Qt.Vertical)
-        self.resizeDocks([self.spatial_dock, self.matrix_dock], [450, 450], Qt.Horizontal)
+        self.resizeDocks([self.spatial_dock, self.audio_player], [700, 200], Qt.Horizontal)
 
 
         # ----------------- MENU AND STATE ------------------------------------
@@ -1530,7 +1529,9 @@ class MainWin(QMainWindow):
         self.audio_table.set_use_full_images(True)
         self.thumb_toggle_act.setChecked(True)
         self._update_similarity_buttons_state()
-        self.matrix_dock.set_model(self.model)
+        self.audio_table.set_use_full_images(True)
+        self.thumb_toggle_act.setChecked(True)
+        self._update_similarity_buttons_state()
         self.spatial_dock.set_model(self.model)
         self.regroup()
 
@@ -1594,7 +1595,7 @@ class MainWin(QMainWindow):
         self.audio_table.set_use_full_images(True)
         self.thumb_toggle_act.setChecked(True)
         self._update_similarity_buttons_state()
-        self.matrix_dock.set_model(self.model)
+        self.audio_player.set_session(self.model)        
         self.spatial_dock.set_model(self.model)
         self.regroup()
 
@@ -1824,8 +1825,6 @@ class MainWin(QMainWindow):
         self.tree.selectionModel().selectionChanged.connect(self.tree._send_bus_update)
         self.tree.collapseAll()
 
-        if hasattr(self, 'matrix_dock'): 
-            self.matrix_dock.update_matrix()
 
     def _update_group_similarity(self, group_item: QStandardItem):
         vals = [v for v in (group_item.child(r, SIM_COL).data(Qt.UserRole) for r in range(group_item.rowCount())) if v is not None]
