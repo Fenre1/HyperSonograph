@@ -1,11 +1,11 @@
 # audio_features.py
 # %%
 from __future__ import annotations
-
+import logging
 import os
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Callable
 from collections import defaultdict
 import numpy as np
 import torch
@@ -34,6 +34,13 @@ MODEL_DIR = _root / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("TORCH_HOME", str(MODEL_DIR))
 
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 # ----------------------------
 # Helpers: loading & segmentation
 # ----------------------------
@@ -201,11 +208,22 @@ class AudioFeatureExtractorBase:
     
     def output_dim(self) -> int: ...
 
-    def extract_features_with_metadata(self, file_list: List[str]) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    def extract_features_with_metadata(
+        self,
+        file_list: List[str],
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         rows: List[Dict[str, Any]] = []
         vecs: List[np.ndarray] = []
 
-        for f in file_list:
+        total = len(file_list)
+
+        for idx, f in enumerate(file_list, start=1):
+            if progress_callback:
+                try:
+                    progress_callback(idx, total, f)
+                except Exception:
+                    logger.exception("Progress callback failed for %s", f)
             # get duration
             try:
                 info = sf.info(f)
@@ -251,7 +269,6 @@ class AudioFeatureExtractorBase:
                     mask = (ts >= s) & (ts <= (e - frame_len))
                 if not np.any(mask):
                     continue
-                print('2',frame_emb.shape)
                 v = frame_emb[mask].mean(axis=0).astype(np.float32)
                 if self.normalize:
                     v = _l2_normalize(v)
@@ -267,10 +284,14 @@ class AudioFeatureExtractorBase:
 
 
     def extract_segments_and_songs(
-        self, file_list: List[str]
+        self,
+        file_list: List[str],
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> Tuple[np.ndarray, List[Dict[str, Any]], List[SongEmbedding]]:
         """Return segment embeddings with metadata and pooled song-level vectors."""
-        X, rows = self.extract_features_with_metadata(file_list)
+        X, rows = self.extract_features_with_metadata(
+            file_list, progress_callback=progress_callback
+        )
         songs = _compute_song_embeddings(X, rows, normalize=self.normalize)
         return X, rows, songs
 
@@ -470,11 +491,22 @@ class TorchOpenL3FeatureExtractor(AudioFeatureExtractorBase):
         return emb.astype(np.float32, copy=False), ts.astype(np.float32, copy=False)
 
     # ------------- main extraction: single pass per file + segment pooling -------------
-    def extract_features_with_metadata(self, file_list: list[str]) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    def extract_features_with_metadata(
+        self,
+        file_list: list[str],
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> tuple[np.ndarray, list[dict[str, Any]]]:
         rows: list[dict[str, Any]] = []
         vecs: list[np.ndarray] = []
 
-        for f in file_list:
+        total = len(file_list)
+
+        for idx, f in enumerate(file_list, start=1):
+            if progress_callback:
+                try:
+                    progress_callback(idx, total, f)
+                except Exception:
+                    logger.exception("Progress callback failed for %s", f)
             # duration
             try:
                 info = sf.info(f)
@@ -727,11 +759,22 @@ class MultiModelAudioExtractor:
         self.ref_sr = int(ref_sr)
         self.normalize = normalize
 
-    def extract_features_with_metadata(self, file_list: List[str]) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    def extract_features_with_metadata(
+        self,
+        file_list: List[str],
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         rows: List[Dict[str, Any]] = []
         vecs: List[np.ndarray] = []
 
-        for f in file_list:
+        total = len(file_list)
+
+        for idx, f in enumerate(file_list, start=1):
+            if progress_callback:
+                try:
+                    progress_callback(idx, total, f)
+                except Exception:
+                    logger.exception("Progress callback failed for %s", f)
             # get duration
             try:
                 info = sf.info(f)
@@ -780,12 +823,17 @@ class MultiModelAudioExtractor:
         return X, rows
 
 
-    def extract_segments_and_songs(self, file_list: List[str]) -> Tuple[np.ndarray, List[Dict[str, Any]], List[SongEmbedding]]:
+    def extract_segments_and_songs(
+        self,
+        file_list: List[str],
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> Tuple[np.ndarray, List[Dict[str, Any]], List[SongEmbedding]]:
         """Return segment embeddings with metadata and pooled song-level vectors."""
-        X, rows = self.extract_features_with_metadata(file_list)
+        X, rows = self.extract_features_with_metadata(
+            file_list, progress_callback=progress_callback
+        )
         songs = _compute_song_embeddings(X, rows, normalize=self.normalize)
         return X, rows, songs
-
 
 
     def extract_feature_arrays(self, file_list: List[str]) -> Tuple[np.ndarray, ...]:

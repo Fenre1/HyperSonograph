@@ -52,7 +52,7 @@ from PyQt5.QtCore import (
     QSortFilterProxyModel,
     QRectF
 )
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, Callable
 from utils.data_loader import (
     DATA_DIRECTORY, get_h5_files_in_directory, load_session_data
 )
@@ -76,6 +76,14 @@ try:
     SYSTEM_DARK_MODE = darkdetect.isDark()
 except Exception:
     SYSTEM_DARK_MODE = False
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 def apply_dark_palette(app: QApplication) -> None:
     """Apply a dark color palette to the given QApplication."""
@@ -801,6 +809,26 @@ class MainWin(QMainWindow):
                 inter_item.setData(int(val), Qt.UserRole)
                 inter_item.setData(str(int(val)), Qt.DisplayRole)
 
+
+    def _make_progress_callback(
+        self,
+        *,
+        app: QApplication | None,
+        action: str,
+    ) -> Callable[[int, int, str], None]:
+        status_bar = self.statusBar()
+
+        def _callback(index: int, total: int, path: str) -> None:
+            display_name = Path(path).name
+            message = f"{action} {index}/{total}: {display_name}"
+            logger.info("%s %d/%d: %s", action, index, total, path)
+            status_bar.showMessage(message)
+            if app:
+                app.processEvents()
+
+        return _callback
+
+
     def __init__(self):
         super().__init__()
         self.setDockNestingEnabled(True)
@@ -1108,6 +1136,18 @@ class MainWin(QMainWindow):
         if not files:
             return
 
+        total_files = len(files)
+        status_bar = self.statusBar()
+        if skipped_count:
+            start_message = (
+                f"Preparing to process {total_files} new file(s); "
+                f"{skipped_count} already in session."
+            )
+        else:
+            start_message = f"Preparing to process {total_files} new file(s)…"
+        logger.info(start_message)
+        status_bar.showMessage(start_message)
+
         app = QApplication.instance()
         if app:
             app.setOverrideCursor(Qt.WaitCursor)
@@ -1120,19 +1160,37 @@ class MainWin(QMainWindow):
         except Exception as e:
             if app:
                 app.restoreOverrideCursor()
+            status_bar.showMessage("Failed to initialize audio model.", 5000)
+            logger.exception("Failed to initialize audio model.")
             QMessageBox.critical(self, "Model Error", str(e))
             return
 
+        progress_callback = self._make_progress_callback(
+            app=app,
+            action="Processing song",
+        )
+
         try:
-            Xseg, rows, songs = extractor.extract_segments_and_songs(files)
+            Xseg, rows, songs = extractor.extract_segments_and_songs(
+                files,
+                progress_callback=progress_callback,
+            )
         except Exception as e:
             if app:
                 app.restoreOverrideCursor()
+            status_bar.showMessage("Extraction failed.", 5000)
+            logger.exception("Audio feature extraction failed.")
             QMessageBox.critical(self, "Extraction Error", str(e))
             return
 
         if app:
             app.restoreOverrideCursor()
+
+        completion_message = f"Finished processing {total_files} new file(s)."
+        if skipped_count:
+            completion_message += f" Skipped {skipped_count} already in session."
+        logger.info(completion_message)
+        status_bar.showMessage(completion_message, 5000)
 
         base_idx = len(self.model.im_list)
         file_to_global = {path: base_idx + i for i, path in enumerate(files)}
@@ -1390,6 +1448,12 @@ class MainWin(QMainWindow):
             QMessageBox.warning(self, "Invalid Input", "Enter valid numbers.")
             return
 
+        total_files = len(files)
+        status_bar = self.statusBar()
+        start_message = f"Preparing to create a new session from {total_files} file(s)…"
+        logger.info(start_message)
+        status_bar.showMessage(start_message)
+
         app = QApplication.instance()
         if app:
             app.setOverrideCursor(Qt.WaitCursor)
@@ -1402,19 +1466,37 @@ class MainWin(QMainWindow):
         except Exception as e:
             if app:
                 app.restoreOverrideCursor()
+            status_bar.showMessage("Failed to initialize audio model.", 5000)
+            logger.exception("Failed to initialize audio model for new session.")
             QMessageBox.critical(self, "Model Error", str(e))
             return
 
+        progress_callback = self._make_progress_callback(
+            app=app,
+            action="Processing song",
+        )
+
         try:
-            Xseg, rows, songs = extractor.extract_segments_and_songs(files)
+            Xseg, rows, songs = extractor.extract_segments_and_songs(
+                files,
+                progress_callback=progress_callback,
+            )
         except Exception as e:
             if app:
                 app.restoreOverrideCursor()
+            status_bar.showMessage("Extraction failed.", 5000)
+            logger.exception("Audio feature extraction failed while creating a new session.")
             QMessageBox.critical(self, "Extraction Error", str(e))
             return
 
         if app:
             app.restoreOverrideCursor()
+
+        completion_message = (
+            f"Finished creating session with {total_files} file(s)."
+        )
+        logger.info(completion_message)
+        status_bar.showMessage(completion_message, 5000)
 
         file_index = {f: i for i, f in enumerate(files)}
         if rows:
