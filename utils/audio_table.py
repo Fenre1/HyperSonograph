@@ -2,26 +2,97 @@ from __future__ import annotations
 
 from functools import partial
 from pathlib import Path
-from typing import List, Optional, Sequence
-
+from typing import Iterable, List, Optional, Sequence
 
 from PyQt5.QtCore import Qt, QSortFilterProxyModel, pyqtSignal as Signal
 from PyQt5.QtGui import QStandardItem, QStandardItemModel
 from PyQt5.QtWidgets import (
-    QDockWidget,
-    QTableView,
-    QWidget,
-    QVBoxLayout,
-    QLineEdit,
-    QTabWidget,
-    QCheckBox,
     QAbstractItemView,
+    QCheckBox,
+    QDockWidget,
+    QLineEdit,
+    QStyle,
+    QTabBar,
+    QTabWidget,
+    QTableView,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
 )
+
 
 from .session_model import SegmentMatchResult, SessionModel
 from .selection_bus import SelectionBus
 INDEX_ROLE = Qt.UserRole + 1
 
+class TagFilterProxyModel(QSortFilterProxyModel):
+    """Proxy model that filters rows based on assigned song tags."""
+
+    def __init__(self, table: "_AudioTable", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._table = table
+        self._allowed_tags: set[str] = set()
+        self._include_untagged = True
+
+    def set_tag_filters(self, tags: Iterable[str], include_untagged: bool) -> None:
+        self._allowed_tags = {str(tag) for tag in tags}
+        self._include_untagged = bool(include_untagged)
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row: int, source_parent) -> bool:  # type: ignore[override]
+        if not super().filterAcceptsRow(source_row, source_parent):
+            return False
+
+        session = self._table.session
+        if session is None:
+            return True
+
+        model = self.sourceModel()
+        if not isinstance(model, QStandardItemModel):
+            return True
+
+        item = model.item(source_row, 0)
+        if item is None:
+            return True
+
+        value = item.data(INDEX_ROLE)
+        if value is None:
+            return True
+
+        try:
+            song_idx = int(value)
+        except (TypeError, ValueError):
+            return True
+
+        tags = session.get_tags_for_song(song_idx)
+        if not tags:
+            return self._include_untagged
+        return bool(tags & self._allowed_tags)
+
+class _AudioTableTabBar(QTabBar):
+    """Tab bar supporting middle-click closing for closable tabs."""
+
+    middleClickCloseRequested = Signal(int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._closable_checker: Callable[[int], bool] | None = None
+
+    def set_closable_checker(self, checker: Callable[[int], bool]) -> None:
+        self._closable_checker = checker
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MiddleButton:
+            index = self.tabAt(event.pos())
+            if index >= 0:
+                closable = True
+                if self._closable_checker is not None:
+                    closable = self._closable_checker(index)
+                if closable:
+                    self.middleClickCloseRequested.emit(index)
+                    event.accept()
+                    return
+        super().mouseReleaseEvent(event)
 
 class _AudioTable(QWidget):
     """Widget showing a filterable table of audio files."""
@@ -42,10 +113,10 @@ class _AudioTable(QWidget):
         self.filter_edit.setPlaceholderText("Filter…")
         layout.addWidget(self.filter_edit)
 
-        self.model = QStandardItemModel(0, 3, self)
-        self.model.setHorizontalHeaderLabels(["File Name", "File Path", "Similarity"])
+        self.model = QStandardItemModel(0, 4, self)
+        self.model.setHorizontalHeaderLabels(["File Name", "File Path", "Similarity", "Tags"])
 
-        self.proxy = QSortFilterProxyModel(self)
+        self.proxy = TagFilterProxyModel(self, self)
         self.proxy.setSourceModel(self.model)
         self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.proxy.setFilterKeyColumn(-1)
@@ -60,6 +131,8 @@ class _AudioTable(QWidget):
 
         self.filter_edit.textChanged.connect(self.proxy.setFilterFixedString)
         self.view.selectionModel().selectionChanged.connect(self._on_selection_changed)
+        self._allowed_tags: set[str] = set()
+        self._include_untagged = True
 
     @property
     def session(self) -> SessionModel:
@@ -79,7 +152,8 @@ class _AudioTable(QWidget):
                 items = [
                     QStandardItem(Path(p).name),
                     QStandardItem(p),
-                    QStandardItem("0.0"),  # placeholder for similarity
+                    QStandardItem(""),
+                    QStandardItem(self._format_tags(idx)),
                 ]
                 for item in items:
                     item.setEditable(False)
@@ -110,7 +184,10 @@ class _AudioTable(QWidget):
                 for item in (name_item, path_item, sim_item):
                     item.setEditable(False)
                     item.setData(int(idx), INDEX_ROLE)
-                self.model.appendRow([name_item, path_item, sim_item])
+                tags_item = QStandardItem(self._format_tags(idx))
+                tags_item.setEditable(False)
+                tags_item.setData(int(idx), INDEX_ROLE)
+                self.model.appendRow([name_item, path_item, sim_item, tags_item])
         self.view.sortByColumn(2, Qt.DescendingOrder)
 
     def is_similarity_tab(self) -> bool:
@@ -154,6 +231,35 @@ class _AudioTable(QWidget):
     def _on_selection_changed(self, *_args) -> None:
         self.selectionChanged.emit(self.selected_song_indices())
 
+    def set_tag_filter(self, allowed: Iterable[str], include_untagged: bool) -> None:
+        self._allowed_tags = {str(tag) for tag in allowed}
+        self._include_untagged = bool(include_untagged)
+        self.proxy.set_tag_filters(self._allowed_tags, self._include_untagged)
+
+    def refresh_tags_for_indices(self, indices: Sequence[int]) -> None:
+        if not indices:
+            return
+        idxs = {int(i) for i in indices}
+        for row in range(self.model.rowCount()):
+            item = self.model.item(row, 0)
+            if not item:
+                continue
+            value = item.data(INDEX_ROLE)
+            if not isinstance(value, (int, float)):
+                continue
+            song_idx = int(value)
+            if song_idx not in idxs:
+                continue
+            tags_item = self.model.item(row, 3)
+            if tags_item is not None:
+                text = self._format_tags(song_idx)
+                tags_item.setText(text)
+        self.proxy.invalidateFilter()
+
+    def _format_tags(self, song_idx: int) -> str:
+        tags = sorted(self._session.get_tags_for_song(song_idx)) if self._session else []
+        return ", ".join(tags)
+
 class AudioTableDock(QDockWidget):
     """Dock widget containing filterable tables of audio files for each model."""
 
@@ -166,6 +272,11 @@ class AudioTableDock(QDockWidget):
         self.bus = bus
 
         self.tabs = QTabWidget(self)
+        self._closable_tabs: dict[QWidget, bool] = {}
+        tab_bar = _AudioTableTabBar(self.tabs)
+        tab_bar.set_closable_checker(self._is_tab_index_closable)
+        tab_bar.middleClickCloseRequested.connect(self._close_tab)
+        self.tabs.setTabBar(tab_bar)
         self.setWidget(self.tabs)
 
         # Exposed checkboxes to keep interface compatibility
@@ -176,8 +287,11 @@ class AudioTableDock(QDockWidget):
         self._hist_pos = -1
 
         self._sessions: dict[str, SessionModel] = {}
+        self._active_tags: set[str] = set()
+        self._include_untagged = True
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
+
 
     # ------------------------------------------------------------------
     # Compatibility helpers
@@ -195,11 +309,13 @@ class AudioTableDock(QDockWidget):
     def add_model(self, name: str, session: SessionModel) -> None:
         table = _AudioTable(session, self)
         self.tabs.addTab(table, name)
-        self._configure_table(table)        
+        self._configure_table(table)
         self._sessions[name] = session
         # show all files initially
         table.set_indices(list(range(len(session.im_list))))
+        table.set_tag_filter(self._active_tags, self._include_untagged)
         self.tabs.setCurrentWidget(table)
+
 
     def show_similarity_results(
         self,
@@ -210,26 +326,34 @@ class AudioTableDock(QDockWidget):
         """Add or update a tab containing similarity-ranked songs."""
         tab_title = f"Similarity – {ref_name}"
         table: _AudioTable | None = None
+        table_index: int | None = None
 
         for idx in range(self.tabs.count()):
             if self.tabs.tabText(idx) == tab_title:
                 widget = self.tabs.widget(idx)
                 if isinstance(widget, _AudioTable):
                     table = widget
+                    table_index = idx
                 else:
                     table = _AudioTable(session, self)
+                    old_widget = widget
                     self.tabs.removeTab(idx)
-                    self.tabs.insertTab(idx, table, tab_title)
-                    self._configure_table(table)                    
+                    self._unregister_tab(old_widget)
+                    table_index = self.tabs.insertTab(idx, table, tab_title)
+                    self._configure_table(table)
                 break
 
         if table is None:
             table = _AudioTable(session, self)
-            self.tabs.addTab(table, tab_title)
+            table_index = self.tabs.addTab(table, tab_title)
             self._configure_table(table)
 
+        if table_index is None:
+            table_index = self.tabs.indexOf(table)
+        self._register_tab(table, True, index=table_index)
         ref_idx = session.edge_to_song_index.get(ref_name)
         table.set_similarity(results, ref_index=ref_idx, ref_name=ref_name)
+        table.set_tag_filter(self._active_tags, self._include_untagged)
         self._sessions[tab_title] = session
         self.tabs.setCurrentWidget(table)
 
@@ -243,11 +367,14 @@ class AudioTableDock(QDockWidget):
         self.historyChanged.emit()
 
     def clear(self) -> None:
+        for widget in list(self._closable_tabs):
+            widget.deleteLater()
+        self._closable_tabs.clear()
         self.tabs.clear()
         self._sessions.clear()
         self._history.clear()
         self._hist_pos = -1
-        self.similarityPairSelected.emit(None)        
+        self.similarityPairSelected.emit(None)
 
     # Methods used by existing code -----------------------------------
     def update_images(self, idxs: List[int], **kwargs) -> None:  # type: ignore[override]
@@ -304,6 +431,59 @@ class AudioTableDock(QDockWidget):
     def _configure_table(self, table: _AudioTable) -> None:
         table.selectionChanged.connect(partial(self._handle_table_selection, table))
 
+
+    def _is_tab_index_closable(self, index: int) -> bool:
+        widget = self.tabs.widget(index)
+        return bool(widget and self._closable_tabs.get(widget, False))
+
+    def _register_tab(self, widget: QWidget, closable: bool, *, index: int | None = None) -> None:
+        self._closable_tabs[widget] = closable
+        if index is None:
+            index = self.tabs.indexOf(widget)
+        if index != -1:
+            self._update_close_button(index)
+
+    def _unregister_tab(self, widget: QWidget | None) -> None:
+        if widget is None:
+            return
+        self._closable_tabs.pop(widget, None)
+        widget.deleteLater()
+
+    def _update_close_button(self, index: int) -> None:
+        if index < 0:
+            return
+        widget = self.tabs.widget(index)
+        closable = bool(widget and self._closable_tabs.get(widget, False))
+        tab_bar = self.tabs.tabBar()
+        existing = tab_bar.tabButton(index, QTabBar.RightSide)
+        if closable:
+            if not isinstance(existing, QToolButton):
+                button = QToolButton(self.tabs)
+                button.setAutoRaise(True)
+                button.setIcon(self.style().standardIcon(QStyle.SP_TitleBarCloseButton))
+                button.setToolTip("Close tab")
+                button.clicked.connect(partial(self._request_close_from_button, widget))
+                tab_bar.setTabButton(index, QTabBar.RightSide, button)
+        else:
+            if isinstance(existing, QToolButton):
+                existing.deleteLater()
+            tab_bar.setTabButton(index, QTabBar.RightSide, None)
+
+    def _request_close_from_button(self, widget: QWidget) -> None:
+        index = self.tabs.indexOf(widget)
+        if index != -1:
+            self._close_tab(index)
+
+    def _close_tab(self, index: int) -> None:
+        if not self._is_tab_index_closable(index):
+            return
+        widget = self.tabs.widget(index)
+        title = self.tabs.tabText(index)
+        self.tabs.removeTab(index)
+        self._sessions.pop(title, None)
+        self._unregister_tab(widget)
+        self.similarityPairSelected.emit(None)
+
     def _handle_table_selection(self, table: _AudioTable, indices: List[int]) -> None:
         unique = sorted({int(i) for i in indices})
         self.bus.set_images(unique)
@@ -336,3 +516,30 @@ class AudioTableDock(QDockWidget):
             self.similarityPairSelected.emit(None)
         else:
             self.similarityPairSelected.emit(payload)
+
+
+
+    def set_tag_filters(self, allowed: Iterable[str], include_untagged: bool) -> None:
+        self._active_tags = {str(tag) for tag in allowed}
+        self._include_untagged = bool(include_untagged)
+        for table in self._iter_tables():
+            table.set_tag_filter(self._active_tags, self._include_untagged)
+
+    def refresh_tags(self, indices: Sequence[int]) -> None:
+        idxs = [int(i) for i in indices]
+        for table in self._iter_tables():
+            table.refresh_tags_for_indices(idxs)
+
+    def current_table(self) -> _AudioTable | None:
+        widget = self.tabs.currentWidget()
+        return widget if isinstance(widget, _AudioTable) else None
+
+    def selected_song_indices(self) -> List[int]:
+        table = self.current_table()
+        return table.selected_song_indices() if table else []
+
+    def _iter_tables(self):
+        for idx in range(self.tabs.count()):
+            widget = self.tabs.widget(idx)
+            if isinstance(widget, _AudioTable):
+                yield widget            

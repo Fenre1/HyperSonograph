@@ -3,6 +3,7 @@
 from __future__ import annotations
 import logging
 import os
+import gc
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional, Callable
@@ -10,6 +11,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 import librosa
+from contextlib import suppress
 import soundfile as sf
 import warnings
 import tensorflow as tf
@@ -205,7 +207,39 @@ class AudioFeatureExtractorBase:
             raise RuntimeError(f"Unexpected tensor rank for hidden states: {hs.shape}")
 
         return pooled.squeeze(0).float().cpu().numpy()
-    
+
+    def close(self) -> None:
+        """Release references to heavyweight models and clear GPU memory."""
+
+        model = getattr(self, "model", None)
+        if isinstance(model, torch.nn.Module):
+            hook = getattr(model, "_hk", None)
+            if hook is not None and hasattr(hook, "remove"):
+                with suppress(Exception):
+                    hook.remove()
+            with suppress(Exception):
+                model.to("cpu")
+        if hasattr(self, "model"):
+            self.model = None
+
+        processor = getattr(self, "processor", None)
+        if processor is not None and hasattr(processor, "to"):
+            with suppress(Exception):
+                processor.to("cpu")
+        if hasattr(self, "processor"):
+            self.processor = None
+
+        if hasattr(self, "_tol3"):
+            self._tol3 = None
+
+        self.device = torch.device("cpu")
+
+        if torch.cuda.is_available():
+            with suppress(Exception):
+                torch.cuda.empty_cache()
+
+        gc.collect()
+
     def output_dim(self) -> int: ...
 
     def extract_features_with_metadata(

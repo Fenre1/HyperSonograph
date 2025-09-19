@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
     QInputDialog,
     QDialog,
     QListWidget,
+    QListWidgetItem,    
     QDialogButtonBox,
     QAbstractItemView,
     QLineEdit,
@@ -52,7 +53,7 @@ from PyQt5.QtCore import (
     QSortFilterProxyModel,
     QRectF
 )
-from typing import Mapping, Sequence, Callable
+from typing import Callable, Iterable, Mapping, Sequence
 from utils.data_loader import (
     DATA_DIRECTORY, get_h5_files_in_directory, load_session_data
 )
@@ -112,6 +113,7 @@ STDDEV_COL = 5
 INTER_COL = 6
 DECIMALS = 3
 UNGROUPED = "Ungrouped"
+UNTAGGED_LABEL = "Untagged"
 
 class _MultiSelectDialog(QDialog):
     """Simple dialog presenting a list for multi-selection."""
@@ -170,6 +172,73 @@ class HyperedgeSelectDialog(QDialog):
         items = self.list_widget.selectedItems()
         return items[0].text() if items else None
 
+class TagSelectionDialog(QDialog):
+    """Dialog presenting a filterable list of tags with checkboxes."""
+
+    def __init__(
+        self,
+        tags: Sequence[str],
+        *,
+        states: Mapping[str, Qt.CheckState] | None = None,
+        allow_partial: bool = False,
+        title: str = "Select Tags",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        layout = QVBoxLayout(self)
+
+        self.filter_edit = QLineEdit(self)
+        self.filter_edit.setPlaceholderText("Filter tags…")
+        layout.addWidget(self.filter_edit)
+
+        self.list_widget = QListWidget(self)
+        layout.addWidget(self.list_widget)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        layout.addWidget(buttons)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        self._items: dict[str, QListWidgetItem] = {}
+        self._initial_states: dict[str, Qt.CheckState] = {}
+
+        provided_states = states or {}
+        for tag in tags:
+            item = QListWidgetItem(tag)
+            flags = item.flags() | Qt.ItemIsUserCheckable
+            if allow_partial:
+                flags |= Qt.ItemIsTristate
+            item.setFlags(flags)
+            state = provided_states.get(tag, Qt.Checked)
+            item.setCheckState(state)
+            self.list_widget.addItem(item)
+            self._items[tag] = item
+            self._initial_states[tag] = state
+
+        self.filter_edit.textChanged.connect(self._apply_filter)
+
+    def _apply_filter(self, text: str) -> None:
+        pattern = text.casefold()
+        for tag, item in self._items.items():
+            item.setHidden(bool(pattern) and pattern not in tag.casefold())
+
+    def checked_tags(self) -> list[str]:
+        return [tag for tag, item in self._items.items() if item.checkState() == Qt.Checked]
+
+    def final_states(self) -> dict[str, Qt.CheckState]:
+        return {tag: item.checkState() for tag, item in self._items.items()}
+
+    def state_changes(self) -> dict[str, Qt.CheckState]:
+        changes: dict[str, Qt.CheckState] = {}
+        for tag, item in self._items.items():
+            final = item.checkState()
+            initial = self._initial_states.get(tag, Qt.Unchecked)
+            if final != initial:
+                if final == Qt.PartiallyChecked and initial == Qt.PartiallyChecked:
+                    continue
+                changes[tag] = final
+        return changes
 
 class NewSessionDialog(QDialog):
     """Dialog to set parameters for a new session."""
@@ -829,6 +898,141 @@ class MainWin(QMainWindow):
         return _callback
 
 
+    def _set_tag_controls_enabled(self, enabled: bool) -> None:
+        for button in (self.btn_add_tag, self.btn_filter_tags, self.btn_edit_tags):
+            button.setEnabled(bool(enabled))
+
+    def _initialize_tag_filters(self) -> None:
+        if not self.model:
+            self._available_tags = []
+            self._active_tag_filters = set()
+            self._tag_filter_include_untagged = True
+            self.audio_table.set_tag_filters(set(), True)
+            self._set_tag_controls_enabled(False)
+            return
+
+        current_tags = sorted(self.model.all_tags())
+        self._available_tags = current_tags
+        self._active_tag_filters = set(current_tags)
+        self._tag_filter_include_untagged = True
+        self.audio_table.set_tag_filters(self._active_tag_filters, self._tag_filter_include_untagged)
+        self._set_tag_controls_enabled(True)
+
+    def _on_model_tags_changed(self, indices: list[int]) -> None:
+        if not self.model:
+            return
+
+        current_tags = sorted(self.model.all_tags())
+        current_set = set(current_tags)
+        previous_set = set(self._available_tags)
+        added = current_set - previous_set
+        self._available_tags = current_tags
+        if added:
+            self._active_tag_filters.update(added)
+        else:
+            self._active_tag_filters = {tag for tag in self._active_tag_filters if tag in current_set}
+        self.audio_table.set_tag_filters(self._active_tag_filters, self._tag_filter_include_untagged)
+        self.audio_table.refresh_tags(indices)
+
+    def add_new_tag(self) -> None:
+        if not self.model:
+            QMessageBox.warning(self, "No Session", "Please load or create a session first.")
+            return
+
+        text, ok = QInputDialog.getText(self, "Add Tag", "Enter a new tag:")
+        if not ok:
+            return
+
+        clean = text.strip()
+        if not clean:
+            QMessageBox.warning(self, "Invalid Tag", "Tag name cannot be empty.")
+            return
+
+        if not self.model.add_tag(clean):
+            QMessageBox.information(self, "Duplicate Tag", f"Tag '{clean}' already exists.")
+            return
+
+        if clean not in self._available_tags:
+            self._available_tags.append(clean)
+            self._available_tags.sort()
+        self._active_tag_filters.add(clean)
+        self.audio_table.set_tag_filters(self._active_tag_filters, self._tag_filter_include_untagged)
+
+    def choose_tag_filters(self) -> None:
+        if not self.model:
+            QMessageBox.warning(self, "No Session", "Please load or create a session first.")
+            return
+
+        current_tags = sorted(self.model.all_tags())
+        self._available_tags = current_tags
+        display_tags = [UNTAGGED_LABEL] + current_tags
+        states: dict[str, Qt.CheckState] = {}
+        for tag in current_tags:
+            states[tag] = Qt.Checked if tag in self._active_tag_filters else Qt.Unchecked
+        states[UNTAGGED_LABEL] = Qt.Checked if self._tag_filter_include_untagged else Qt.Unchecked
+
+        dialog = TagSelectionDialog(
+            display_tags,
+            states=states,
+            title="Filter Songs by Tag",
+            parent=self,
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        checked = dialog.checked_tags()
+        include_untagged = UNTAGGED_LABEL in checked
+        selected_tags = {tag for tag in checked if tag != UNTAGGED_LABEL}
+        self._active_tag_filters = selected_tags
+        self._tag_filter_include_untagged = include_untagged
+        self.audio_table.set_tag_filters(self._active_tag_filters, self._tag_filter_include_untagged)
+
+    def edit_tags_for_selection(self) -> None:
+        if not self.model:
+            QMessageBox.warning(self, "No Session", "Please load or create a session first.")
+            return
+
+        indices = self.audio_table.selected_song_indices()
+        if not indices:
+            QMessageBox.information(self, "No Selection", "Select one or more songs in the table first.")
+            return
+
+        tags = sorted(self.model.all_tags())
+        if not tags:
+            QMessageBox.information(self, "No Tags", "Add a tag before editing song tags.")
+            return
+
+        states: dict[str, Qt.CheckState] = {}
+        for tag in tags:
+            membership = [tag in self.model.get_tags_for_song(idx) for idx in indices]
+            if all(membership):
+                states[tag] = Qt.Checked
+            elif any(membership):
+                states[tag] = Qt.PartiallyChecked
+            else:
+                states[tag] = Qt.Unchecked
+
+        dialog = TagSelectionDialog(
+            tags,
+            states=states,
+            allow_partial=True,
+            title="Edit Tags",
+            parent=self,
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        changes = dialog.state_changes()
+        to_add = [tag for tag, state in changes.items() if state == Qt.Checked]
+        to_remove = [tag for tag, state in changes.items() if state == Qt.Unchecked]
+        if not to_add and not to_remove:
+            return
+
+        self.model.update_song_tags(indices, add=to_add, remove=to_remove)
+        if to_add:
+            self._active_tag_filters.update(to_add)
+            self.audio_table.set_tag_filters(self._active_tag_filters, self._tag_filter_include_untagged)
+
     def __init__(self):
         super().__init__()
         self.setDockNestingEnabled(True)
@@ -856,6 +1060,11 @@ class MainWin(QMainWindow):
         self._skip_reset_timer = QTimer(self)
         self._skip_reset_timer.setSingleShot(True)
         self._skip_reset_timer.timeout.connect(lambda: setattr(self, "_skip_next_layout", False))
+
+
+        self._available_tags: list[str] = []
+        self._active_tag_filters: set[str] = set()
+        self._tag_filter_include_untagged = True
 
         # ----------------- WIDGET AND DOCK CREATION ------------------------------------
         # Create all widgets and docks first, then arrange them.
@@ -971,6 +1180,21 @@ class MainWin(QMainWindow):
         self.audio_table = AudioTableDock(self.bus, self)
         toolbar_layout.addWidget(self.audio_table.hide_selected_cb)
         toolbar_layout.addWidget(self.audio_table.hide_modified_cb)
+
+        self.btn_add_tag = QPushButton("Add New Tag")
+        self.btn_add_tag.clicked.connect(self.add_new_tag)
+        self.btn_add_tag.setEnabled(False)
+        toolbar_layout.addWidget(self.btn_add_tag)
+
+        self.btn_filter_tags = QPushButton("Filter Tags")
+        self.btn_filter_tags.clicked.connect(self.choose_tag_filters)
+        self.btn_filter_tags.setEnabled(False)
+        toolbar_layout.addWidget(self.btn_filter_tags)
+
+        self.btn_edit_tags = QPushButton("Add tag to selected song(s)")
+        self.btn_edit_tags.clicked.connect(self.edit_tags_for_selection)
+        self.btn_edit_tags.setEnabled(False)
+        toolbar_layout.addWidget(self.btn_edit_tags)
 
         toolbar_layout.addStretch()
         self.toolbar_dock.setWidget(toolbar_container)
@@ -1175,6 +1399,8 @@ class MainWin(QMainWindow):
                 files,
                 progress_callback=progress_callback,
             )
+            centroid_dim = extractor.output_dim()
+            model_name = extractor.model_name            
         except Exception as e:
             if app:
                 app.restoreOverrideCursor()
@@ -1182,7 +1408,12 @@ class MainWin(QMainWindow):
             logger.exception("Audio feature extraction failed.")
             QMessageBox.critical(self, "Extraction Error", str(e))
             return
-
+        finally:
+            if extractor and hasattr(extractor, "close"):
+                try:
+                    extractor.close()
+                except Exception:
+                    logger.exception("Failed to release audio model resources.")
         if app:
             app.restoreOverrideCursor()
 
@@ -1212,7 +1443,7 @@ class MainWin(QMainWindow):
             end_s=end_s,
         )
 
-        centroid_dim = extractor.output_dim()
+
         stats_dim = centroid_dim * 2
         centroids = np.zeros((len(files), centroid_dim), dtype=np.float32)
         stats = np.zeros((len(files), stats_dim), dtype=np.float32)
@@ -1231,7 +1462,7 @@ class MainWin(QMainWindow):
             path=list(files),
         )
 
-        model_name = extractor.model_name
+
         model_feats = {
             model_name: ModelFeatures(
                 name=model_name,
@@ -1481,6 +1712,8 @@ class MainWin(QMainWindow):
                 files,
                 progress_callback=progress_callback,
             )
+            centroid_dim = extractor.output_dim()
+            model_name = extractor.model_name            
         except Exception as e:
             if app:
                 app.restoreOverrideCursor()
@@ -1488,7 +1721,12 @@ class MainWin(QMainWindow):
             logger.exception("Audio feature extraction failed while creating a new session.")
             QMessageBox.critical(self, "Extraction Error", str(e))
             return
-
+        finally:
+            if extractor and hasattr(extractor, "close"):
+                try:
+                    extractor.close()
+                except Exception:
+                    logger.exception("Failed to release audio model resources.")
         if app:
             app.restoreOverrideCursor()
 
@@ -1515,7 +1753,7 @@ class MainWin(QMainWindow):
             end_s=end_s,
         )
 
-        centroid_dim = extractor.output_dim()
+
         stats_dim = centroid_dim * 2
         centroids = np.zeros((len(files), centroid_dim), dtype=np.float32)
         stats = np.zeros((len(files), stats_dim), dtype=np.float32)
@@ -1534,7 +1772,7 @@ class MainWin(QMainWindow):
             path=files,
         )
 
-        model_name = extractor.model_name
+
         model_feats = {
             model_name: ModelFeatures(
                 name=model_name,
@@ -1603,6 +1841,7 @@ class MainWin(QMainWindow):
             self._overview_triplets = None
             self.model.layoutChanged.connect(self._on_layout_changed)
             self.model.hyperedgeModified.connect(self._on_model_hyperedge_modified)
+            self.model.tagsChanged.connect(self._on_model_tags_changed)            
         except Exception as e:
             QMessageBox.critical(self, "Load error", str(e))
             return
@@ -1618,6 +1857,7 @@ class MainWin(QMainWindow):
         self._update_similarity_buttons_state()
         self.audio_player.set_session(self.model)
         self.spatial_dock.set_model(self.model)
+        self._initialize_tag_filters()        
         self.regroup()
 
 
@@ -1658,6 +1898,7 @@ class MainWin(QMainWindow):
             (self.model.layoutChanged, self.regroup),
             (self.model.layoutChanged, self._on_layout_changed),
             (self.model.hyperedgeModified, self._on_model_hyperedge_modified),
+            (self.model.tagsChanged, self._on_model_tags_changed),            
         ):
             try:
                 signal.disconnect(slot)
@@ -1673,17 +1914,17 @@ class MainWin(QMainWindow):
         self._overview_triplets = None
         self.model.layoutChanged.connect(self._on_layout_changed)
         self.model.hyperedgeModified.connect(self._on_model_hyperedge_modified)
-
+        self.model.tagsChanged.connect(self._on_model_tags_changed)
         self.audio_table.clear()
         for name in self._model_names:
             self.audio_table.add_model(name, self.model)
         self.audio_table.set_use_full_images(True)
         self.thumb_toggle_act.setChecked(True)
         self._update_similarity_buttons_state()
-        self.audio_player.set_session(self.model)        
+        self.audio_player.set_session(self.model)
         self.spatial_dock.set_model(self.model)
+        self._initialize_tag_filters()
         self.regroup()
-
 
     def _on_layout_changed(self):
         self._overview_triplets = None

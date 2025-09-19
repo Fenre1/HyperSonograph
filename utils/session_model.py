@@ -3,6 +3,7 @@ import uuid
 import hashlib
 import numpy as np
 import pandas as pd
+import json
 import h5py
 from pathlib import Path
 from typing import Dict, List, Set, Iterable, Optional, Sequence, Mapping
@@ -49,7 +50,15 @@ class SessionModel(QObject):
     layoutChanged    = Signal()              # big regroup or reload
     similarityDirty  = Signal()              # vectors changed; views may flush
     hyperedgeModified = Signal(str)
+    tagsChanged = Signal(list)
 
+    @staticmethod
+    def _normalize_tag(tag: str | None) -> str:
+        if tag is None:
+            return ""
+        clean = str(tag).strip()
+        return clean
+    
     @classmethod
     def load_h5(cls, path: Path) -> "SessionModel":
         with h5py.File(path, "r") as hdf:
@@ -117,6 +126,36 @@ class SessionModel(QObject):
                     meta_json = meta_json.decode("utf-8")
                 metadata_df = pd.read_json(meta_json, orient="table")
 
+            tag_list: list[str] | None = None
+            if "tag_list" in hdf:
+                raw_tags = hdf["tag_list"][()]
+                tag_list = [
+                    t.decode("utf-8") if isinstance(t, bytes) else str(t)
+                    for t in raw_tags
+                    if str(t).strip()
+                ]
+
+            song_tags: list[list[str]] | None = None
+            if "song_tags" in hdf:
+                raw_song_tags = hdf["song_tags"][()]
+                song_tags = []
+                for entry in raw_song_tags:
+                    if isinstance(entry, bytes):
+                        entry = entry.decode("utf-8")
+                    text = str(entry)
+                    if not text:
+                        song_tags.append([])
+                        continue
+                    try:
+                        values = json.loads(text)
+                        if isinstance(values, list):
+                            song_tags.append([str(v) for v in values])
+                            continue
+                    except json.JSONDecodeError:
+                        pass
+                    parts = [seg.strip() for seg in text.split(",") if seg.strip()]
+                    song_tags.append(parts)
+
             seen_raw = hdf["edge_seen_times"][()] if "edge_seen_times" in hdf else None
 
             model_names: List[str] = []
@@ -160,6 +199,8 @@ class SessionModel(QObject):
             metadata=metadata_df,
             model_features=model_feats,
             model_names=model_names,
+            song_tags=song_tags,
+            all_tags=tag_list,            
         )
 
 
@@ -263,7 +304,23 @@ class SessionModel(QObject):
             except Exception:
                 meta_json = self.metadata.astype(str).to_json(orient="table")
                 print('meta json 2')
-            hdf.create_dataset("metadata", data=np.string_(meta_json), dtype=dt)            
+            hdf.create_dataset("metadata", data=np.string_(meta_json), dtype=dt)
+
+            print('meta json 3')
+            tag_payload = [
+                json.dumps(sorted(tags))
+                for tags in self._song_tags
+            ]
+            hdf.create_dataset(
+                "song_tags",
+                data=np.array(tag_payload, dtype=object),
+                dtype=dt,
+            )
+            hdf.create_dataset(
+                "tag_list",
+                data=np.array(sorted(self._all_tags), dtype=object),
+                dtype=dt,
+            )
             
             print('meta json 3')
             if self.thumbnail_data:
@@ -301,6 +358,8 @@ class SessionModel(QObject):
                  edge_origins: Optional[List[str]] | None = None,
                  edge_last_seen: Optional[List[float]] | None = None,
                  metadata: pd.DataFrame | None = None,
+                 song_tags: Sequence[Sequence[str]] | None = None,
+                 all_tags: Sequence[str] | None = None,                 
                  model_features: dict[str, ModelFeatures] | None = None,
                  model_names: List[str] | None = None):
         super().__init__()
@@ -320,6 +379,34 @@ class SessionModel(QObject):
         self.edge_origins = edge_origins or {name: "swin" for name in self.cat_list}
 
         self.metadata = metadata if metadata is not None else self._extract_image_metadata(im_list)
+
+        total_songs = len(self.im_list)
+        self._song_tags: List[Set[str]] = []
+        if song_tags is None:
+            self._song_tags = [set() for _ in range(total_songs)]
+        else:
+            for idx in range(total_songs):
+                if idx < len(song_tags):
+                    entries = song_tags[idx]
+                else:
+                    entries = []
+                normalized = {
+                    self._normalize_tag(tag)
+                    for tag in entries
+                    if self._normalize_tag(tag)
+                }
+                self._song_tags.append(normalized)
+
+        self._all_tags: Set[str] = set()
+        if all_tags is not None:
+            for tag in all_tags:
+                clean = self._normalize_tag(tag)
+                if clean:
+                    self._all_tags.add(clean)
+        for tags in self._song_tags:
+            for tag in tags:
+                if tag:
+                    self._all_tags.add(tag)
 
         self.status_map = {n: {"uuid": str(uuid.uuid4()), "status": "Original"}
                            for n in self.cat_list}
@@ -379,6 +466,71 @@ class SessionModel(QObject):
     @property
     def features_unit(self) -> np.ndarray:
         return self._features_unit
+
+    def all_tags(self) -> Set[str]:
+        return set(self._all_tags)
+
+    def add_tag(self, tag: str) -> bool:
+        clean = self._normalize_tag(tag)
+        if not clean or clean in self._all_tags:
+            return False
+        self._all_tags.add(clean)
+        return True
+
+    def get_tags_for_song(self, index: int) -> Set[str]:
+        if 0 <= index < len(self._song_tags):
+            return set(self._song_tags[index])
+        return set()
+
+    def set_song_tags(self, index: int, tags: Iterable[str]) -> bool:
+        if not 0 <= index < len(self._song_tags):
+            return False
+        normalized = {
+            self._normalize_tag(tag)
+            for tag in tags
+            if self._normalize_tag(tag)
+        }
+        current = self._song_tags[index]
+        if normalized == current:
+            return False
+        self._song_tags[index] = normalized
+        if normalized:
+            self._all_tags.update(normalized)
+        self.tagsChanged.emit([int(index)])
+        return True
+
+    def update_song_tags(
+        self,
+        indices: Sequence[int],
+        *,
+        add: Iterable[str] | None = None,
+        remove: Iterable[str] | None = None,
+    ) -> List[int]:
+        add_set = {
+            self._normalize_tag(tag)
+            for tag in (add or [])
+            if self._normalize_tag(tag)
+        }
+        remove_set = {
+            self._normalize_tag(tag)
+            for tag in (remove or [])
+            if self._normalize_tag(tag)
+        }
+        changed: list[int] = []
+        for idx in indices:
+            if not 0 <= idx < len(self._song_tags):
+                continue
+            current = self._song_tags[idx]
+            new_tags = (current | add_set) - remove_set
+            if new_tags != current:
+                self._song_tags[idx] = new_tags
+                changed.append(int(idx))
+        if add_set:
+            self._all_tags.update(add_set)
+        if changed:
+            self.tagsChanged.emit(changed)
+        return changed
+
 
     @staticmethod
     def _prepare_hypergraph_structures(df):
@@ -745,7 +897,7 @@ class SessionModel(QObject):
 
         start_idx = len(self.im_list)
         self.im_list.extend(str(p) for p in files)
-
+        self._song_tags.extend([set() for _ in range(n_new)])
         # Maintain thumbnail list length if thumbnails are stored
         if self.thumbnail_data is not None:
             if not isinstance(self.thumbnail_data, list):
