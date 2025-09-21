@@ -8,14 +8,14 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional, Callable
 from collections import defaultdict
+import shutil
+import subprocess
 import numpy as np
 import torch
 import librosa
 from contextlib import suppress
 import soundfile as sf
 import warnings
-import tensorflow as tf
-from tensorflow.keras import Model
 import openl3
 import torch
 import torch.nn as nn
@@ -47,16 +47,138 @@ logger.propagate = False
 # Helpers: loading & segmentation
 # ----------------------------
 
-def load_audio_mono(path: str | Path, target_sr: int = 48000,
-                    offset: float = 0.0, duration: Optional[float] = None) -> Tuple[np.ndarray, int]:
-    # first attempt
-    y, sr = librosa.load(str(path), sr=target_sr, mono=True,
-                         offset=float(offset), duration=duration)
-    # tail rounding can yield empty; retry with a tiny pad
-    if y.size == 0 and duration is not None and duration > 0:
-        y, sr = librosa.load(str(path), sr=target_sr, mono=True,
-                             offset=float(offset), duration=float(duration) + 1e-2)
-    return np.asarray(y, dtype=np.float32, order="C"), target_sr
+def _ensure_mono(y: np.ndarray) -> np.ndarray:
+    arr = np.asarray(y, dtype=np.float32)
+    if arr.ndim == 1:
+        return arr
+    if arr.ndim == 2:
+        if 1 in arr.shape:
+            return arr.reshape(-1)
+        axis = 1 if arr.shape[1] <= arr.shape[0] else 0
+        return arr.mean(axis=axis)
+    axes = tuple(range(1, arr.ndim))
+    return arr.mean(axis=axes)
+
+
+def _load_with_soundfile_backend(
+    path: Path,
+    target_sr: int,
+    offset: float,
+    duration: Optional[float],
+) -> np.ndarray:
+    with sf.SoundFile(str(path), "r") as handle:
+        sr = int(handle.samplerate)
+        total_frames = len(handle)
+        if offset > 0.0 and total_frames > 0:
+            start_frame = int(round(offset * sr))
+            start_frame = max(0, min(start_frame, total_frames))
+            handle.seek(start_frame)
+        frames_to_read = -1
+        if duration is not None and duration > 0.0:
+            frames_to_read = int(round(duration * sr))
+            frames_to_read = max(0, frames_to_read)
+        data = handle.read(frames_to_read, dtype="float32", always_2d=True)
+
+    if data.size == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    mono = _ensure_mono(data).astype(np.float32, copy=False)
+    if sr != target_sr:
+        mono = librosa.resample(mono, orig_sr=sr, target_sr=target_sr)
+    return np.ascontiguousarray(mono, dtype=np.float32)
+
+
+def _load_with_ffmpeg_backend(
+    path: Path,
+    target_sr: int,
+    offset: float,
+    duration: Optional[float],
+) -> np.ndarray:
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        raise RuntimeError("ffmpeg executable not found in PATH")
+
+    cmd = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+    ]
+    if offset > 0.0:
+        cmd += ["-ss", f"{offset:.9f}"]
+    cmd += ["-i", str(path), "-ac", "1", "-ar", str(int(target_sr))]
+    if duration is not None and duration > 0.0:
+        cmd += ["-t", f"{duration:.9f}"]
+    cmd += ["-f", "f32le", "pipe:1"]
+
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+
+    if not result.stdout:
+        return np.zeros(0, dtype=np.float32)
+
+    audio = np.frombuffer(result.stdout, dtype="<f4")
+    return np.ascontiguousarray(audio, dtype=np.float32)
+
+
+def load_audio_mono(
+    path: str | Path,
+    target_sr: int = 48000,
+    offset: float = 0.0,
+    duration: Optional[float] = None,
+) -> Tuple[np.ndarray, int]:
+    path = Path(path)
+    offset = float(offset)
+    duration_f = float(duration) if duration is not None else None
+
+    errors: list[str] = []
+
+    try:
+        y, _ = librosa.load(
+            str(path),
+            sr=target_sr,
+            mono=True,
+            offset=offset,
+            duration=duration_f,
+        )
+        if y.size == 0 and duration_f is not None and duration_f > 0:
+            y, _ = librosa.load(
+                str(path),
+                sr=target_sr,
+                mono=True,
+                offset=offset,
+                duration=duration_f + 1e-2,
+            )
+        if y.size > 0:
+            return np.ascontiguousarray(np.asarray(y, dtype=np.float32)), target_sr
+        if duration is not None:
+            return np.ascontiguousarray(np.asarray(y, dtype=np.float32)), target_sr
+        errors.append("librosa returned empty audio")
+    except Exception as exc:  # pragma: no cover - defensive: backend-specific errors
+        errors.append(f"librosa: {exc}")
+
+    for loader, name in (
+        (_load_with_soundfile_backend, "soundfile"),
+        (_load_with_ffmpeg_backend, "ffmpeg"),
+    ):
+        try:
+            data = loader(path, target_sr, offset, duration_f)
+        except Exception as exc:  # pragma: no cover - backend optional
+            errors.append(f"{name}: {exc}")
+            continue
+
+        if data.size > 0:
+            return np.ascontiguousarray(data, dtype=np.float32), target_sr
+        if duration is not None:
+            return np.ascontiguousarray(np.asarray(data, dtype=np.float32)), target_sr
+
+    if errors:
+        logger.warning("Failed to load %s (%s)", path, "; ".join(errors))
+    return np.zeros(0, dtype=np.float32), target_sr
 
 
 def segment_bounds(
@@ -650,118 +772,118 @@ class TorchOpenL3FeatureExtractor(AudioFeatureExtractorBase):
 #     def output_dim(self) -> int:
 #         return int(self.embedding_size)
 
-class OpenL3FeatureExtractor(AudioFeatureExtractorBase):
-    """
-    Optional: requires openl3 (works well on Python 3.11).
-    pip install openl3 tensorflow
-    """
+# class OpenL3FeatureExtractor(AudioFeatureExtractorBase):
+#     """
+#     Optional: requires openl3 (works well on Python 3.11).
+#     pip install openl3 tensorflow
+#     """
 
-    def __init__(
-        self,
-        input_repr: str = "mel256",
-        content_type: str = "music",
-        embedding_size: int = 512,
-        center: bool = False,
-        hop_size: float = 0.5,
-        layer: str | int | None = None,
-        frontend: str = "kapre",
-        batch_size: int = 128,           
-        **kwargs,
-    ):
-        self.input_repr = input_repr
-        self.content_type = content_type
-        self.embedding_size = int(embedding_size)
-        self.center = center
-        self.hop_size = float(hop_size)
-        self.layer_spec = layer
-        self.frontend = str(frontend)
-        self.batch_size = int(batch_size)
-        super().__init__(**kwargs)
+#     def __init__(
+#         self,
+#         input_repr: str = "mel256",
+#         content_type: str = "music",
+#         embedding_size: int = 512,
+#         center: bool = False,
+#         hop_size: float = 0.5,
+#         layer: str | int | None = None,
+#         frontend: str = "kapre",
+#         batch_size: int = 128,           
+#         **kwargs,
+#     ):
+#         self.input_repr = input_repr
+#         self.content_type = content_type
+#         self.embedding_size = int(embedding_size)
+#         self.center = center
+#         self.hop_size = float(hop_size)
+#         self.layer_spec = layer
+#         self.frontend = str(frontend)
+#         self.batch_size = int(batch_size)
+#         super().__init__(**kwargs)
 
-    def _init_model(self) -> None:
+#     def _init_model(self) -> None:
         
-        self._openl3 = openl3
-        base = openl3.models.load_audio_embedding_model(
-            input_repr=self.input_repr,
-            content_type=self.content_type,
-            embedding_size=self.embedding_size,
-            frontend=self.frontend,  # allow 'kapre' (GPU) or 'librosa' (CPU)
-        )
+#         self._openl3 = openl3
+#         base = openl3.models.load_audio_embedding_model(
+#             input_repr=self.input_repr,
+#             content_type=self.content_type,
+#             embedding_size=self.embedding_size,
+#             frontend=self.frontend,  # allow 'kapre' (GPU) or 'librosa' (CPU)
+#         )
 
 
-        # Pick layer
-        out_tensor = base.output
-        layer_name = "embedding"  # nice default label
+#         # Pick layer
+#         out_tensor = base.output
+#         layer_name = "embedding"  # nice default label
 
-        if self.layer_spec is not None:
-            if isinstance(self.layer_spec, int):
-                chosen = base.layers[self.layer_spec]
-                out_tensor = chosen.output
-                layer_name = chosen.name
-            elif isinstance(self.layer_spec, str):
-                # convenience aliases
-                if self.layer_spec.lower() in {"embedding", "final", "last"}:
-                    out_tensor = base.output
-                    layer_name = "embedding"
-                elif self.layer_spec.lower() in {"penultimate", "prelogits", "before_dense"}:
-                    # common case: second-to-last layer
-                    chosen = base.layers[-2]
-                    out_tensor = chosen.output
-                    layer_name = chosen.name
-                else:
-                    chosen = base.get_layer(self.layer_spec)
-                    out_tensor = chosen.output
-                    layer_name = chosen.name
-            else:
-                raise ValueError("layer must be None, int (index), or str (name)")
+#         if self.layer_spec is not None:
+#             if isinstance(self.layer_spec, int):
+#                 chosen = base.layers[self.layer_spec]
+#                 out_tensor = chosen.output
+#                 layer_name = chosen.name
+#             elif isinstance(self.layer_spec, str):
+#                 # convenience aliases
+#                 if self.layer_spec.lower() in {"embedding", "final", "last"}:
+#                     out_tensor = base.output
+#                     layer_name = "embedding"
+#                 elif self.layer_spec.lower() in {"penultimate", "prelogits", "before_dense"}:
+#                     # common case: second-to-last layer
+#                     chosen = base.layers[-2]
+#                     out_tensor = chosen.output
+#                     layer_name = chosen.name
+#                 else:
+#                     chosen = base.get_layer(self.layer_spec)
+#                     out_tensor = chosen.output
+#                     layer_name = chosen.name
+#             else:
+#                 raise ValueError("layer must be None, int (index), or str (name)")
 
-            # If this is a feature map, pool spatial/time dims so we return a vector per frame
-            rank = len(out_tensor.shape)
-            if rank == 4:
-                out_tensor = tf.keras.layers.GlobalAveragePooling2D(name="l3_gap2d")(out_tensor)
-            elif rank == 3:
-                out_tensor = tf.keras.layers.GlobalAveragePooling1D(name="l3_gap1d")(out_tensor)
-            elif rank == 2:
-                pass  # already (batch, D)
-            else:
-                raise RuntimeError(f"Unexpected tensor rank {rank} for layer '{layer_name}'")
+#             # If this is a feature map, pool spatial/time dims so we return a vector per frame
+#             rank = len(out_tensor.shape)
+#             if rank == 4:
+#                 out_tensor = tf.keras.layers.GlobalAveragePooling2D(name="l3_gap2d")(out_tensor)
+#             elif rank == 3:
+#                 out_tensor = tf.keras.layers.GlobalAveragePooling1D(name="l3_gap1d")(out_tensor)
+#             elif rank == 2:
+#                 pass  # already (batch, D)
+#             else:
+#                 raise RuntimeError(f"Unexpected tensor rank {rank} for layer '{layer_name}'")
 
-        # Build the submodel we’ll hand to openl3.get_audio_embedding
+#         # Build the submodel we’ll hand to openl3.get_audio_embedding
         
-        self.submodel = Model(inputs=base.input, outputs=out_tensor,
-                            name=f"openl3_sub_{layer_name}")
-        self._output_dim = int(self.submodel.output_shape[-1])
-        self.model_name = f"openl3_{self.content_type}_{self.input_repr}_{self.embedding_size}" \
-                        + (f"@{layer_name}" if self.layer_spec is not None else "")
+#         self.submodel = Model(inputs=base.input, outputs=out_tensor,
+#                             name=f"openl3_sub_{layer_name}")
+#         self._output_dim = int(self.submodel.output_shape[-1])
+#         self.model_name = f"openl3_{self.content_type}_{self.input_repr}_{self.embedding_size}" \
+#                         + (f"@{layer_name}" if self.layer_spec is not None else "")
 
 
-    def _embed_file_frames(self, y: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
-        # returns (frames_TxD, ts_T)
-        emb, ts = self._openl3.get_audio_embedding(
-            audio=y, sr=sr, model=self.submodel,
-            center=self.center, hop_size=self.hop_size,
-            batch_size=self.batch_size,
-            frontend=self.frontend,   # honored when model has no kapre frontend
-            verbose=False
-        )
-        # emb: (T, D), ts: (T,)
-        return np.asarray(emb, np.float32, order="C"), np.asarray(ts, np.float32)
+#     def _embed_file_frames(self, y: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
+#         # returns (frames_TxD, ts_T)
+#         emb, ts = self._openl3.get_audio_embedding(
+#             audio=y, sr=sr, model=self.submodel,
+#             center=self.center, hop_size=self.hop_size,
+#             batch_size=self.batch_size,
+#             frontend=self.frontend,   # honored when model has no kapre frontend
+#             verbose=False
+#         )
+#         # emb: (T, D), ts: (T,)
+#         return np.asarray(emb, np.float32, order="C"), np.asarray(ts, np.float32)
 
 
-    def _embed_waveform(self, y: np.ndarray, sr: int) -> np.ndarray:
-        # Use openl3’s framing, but with our submodel to fetch the desired layer
-        emb, _ts = self._openl3.get_audio_embedding(
-            y,
-            sr,
-            model=self.submodel,  # <-- custom layer output
-            center=self.center,
-            hop_size=self.hop_size,
-        )
-        # mean over frames -> one vector for the segment
-        return np.asarray(emb.mean(axis=0), dtype=np.float32, order="C")
+#     def _embed_waveform(self, y: np.ndarray, sr: int) -> np.ndarray:
+#         # Use openl3’s framing, but with our submodel to fetch the desired layer
+#         emb, _ts = self._openl3.get_audio_embedding(
+#             y,
+#             sr,
+#             model=self.submodel,  # <-- custom layer output
+#             center=self.center,
+#             hop_size=self.hop_size,
+#         )
+#         # mean over frames -> one vector for the segment
+#         return np.asarray(emb.mean(axis=0), dtype=np.float32, order="C")
 
-    def output_dim(self) -> int:
-        return self._output_dim
+#     def output_dim(self) -> int:
+#         return self._output_dim
 
 
 # Multi-model wrapper

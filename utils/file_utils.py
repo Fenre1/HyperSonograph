@@ -29,7 +29,7 @@ def get_audio_files(directory: str) -> List[str]:
 
     directory = os.fspath(directory)
     # normalise extensions once to avoid repeated allocations inside the loop
-    exts = {".mp3", ".wav"}
+    exts = {".mp3", ".wav", ".opus"}
     collected: List[str] = []
 
     for root, dirs, files in os.walk(directory):
